@@ -33,6 +33,8 @@ from headcount.config.settings import get_settings
 from headcount.db.enums import (
     CompanyRunStage,
     CompanyRunStageStatus,
+    ReviewReason,
+    ReviewStatus,
     RunKind,
     RunStatus,
     SourceName,
@@ -56,8 +58,14 @@ from headcount.ingest.rate_limit import (
 from headcount.models.company import Company
 from headcount.models.company_alias import CompanyAlias
 from headcount.models.company_anchor_observation import CompanyAnchorObservation
+from headcount.models.review_queue_item import ReviewQueueItem
 from headcount.models.run import CompanyRunStatus, Run
 from headcount.models.source_observation import SourceObservation
+from headcount.review.queue_writer import (
+    DbReviewQueueWriter,
+    EnqueueRequest,
+    ReviewQueueWriter,
+)
 from headcount.utils.logging import get_logger
 
 _log = get_logger("headcount.ingest.collect")
@@ -71,6 +79,9 @@ class CollectResult:
     anchors_written: int = 0
     companies_attempted: int = 0
     companies_with_signals: int = 0
+    companies_gated: int = 0
+    linkedin_gated_companies: int = 0
+    review_items_enqueued: int = 0
     errors: list[str] = field(default_factory=list)
 
     def summary(self) -> dict[str, Any]:
@@ -78,6 +89,9 @@ class CollectResult:
             "run_id": self.run_id,
             "companies_attempted": self.companies_attempted,
             "companies_with_signals": self.companies_with_signals,
+            "companies_gated": self.companies_gated,
+            "linkedin_gated_companies": self.linkedin_gated_companies,
+            "review_items_enqueued": self.review_items_enqueued,
             "signals_written": self.signals_written,
             "anchors_written": self.anchors_written,
             "errors": len(self.errors),
@@ -218,6 +232,26 @@ def _existing_hashes(session: Session, company_id: str) -> set[tuple[str, str]]:
     return {(name.value, digest) for name, digest in rows}
 
 
+def _has_open_linkedin_gate_item(session: Session, *, run_id: str, company_id: str) -> bool:
+    """Check whether we already enqueued a linkedin_gated item for this run+company.
+
+    Keeps ``collect_anchors`` idempotent: rerunning the collector must
+    not pile duplicate review items for a company that keeps getting
+    gated.
+    """
+    row = session.execute(
+        select(ReviewQueueItem.id)
+        .where(
+            ReviewQueueItem.company_id == company_id,
+            ReviewQueueItem.review_reason == ReviewReason.linkedin_gated,
+            ReviewQueueItem.status != ReviewStatus.resolved,
+            ReviewQueueItem.detail.like(f"run={run_id}%"),
+        )
+        .limit(1)
+    ).first()
+    return row is not None
+
+
 async def collect_anchors(
     session: Session,
     *,
@@ -229,6 +263,7 @@ async def collect_anchors(
     default_budget: int = 1000,
     trip_after: int = 5,
     method_version: str | None = None,
+    review_writer: ReviewQueueWriter | None = None,
 ) -> CollectResult:
     """Collect anchor signals from every adapter for every company.
 
@@ -247,6 +282,7 @@ async def collect_anchors(
         default_allowed=default_budget,
         trip_after_n_failures=trip_after,
     )
+    writer = review_writer or DbReviewQueueWriter(session)
     reports: dict[SourceName, FetchReport] = {}
     for adapter in adapters:
         reports.setdefault(adapter.source_name, FetchReport(source_name=adapter.source_name))
@@ -277,6 +313,10 @@ async def collect_anchors(
             existing_hashes = _existing_hashes(session, company.id)
             any_signal = False
             stage_errors: list[str] = []
+            adapters_run = 0
+            adapters_gated = 0
+            adapters_failed = 0
+            linkedin_gated_here = False
             for adapter in adapters:
                 report = reports[adapter.source_name]
                 breaker = CircuitBreaker(store=budget_store, source=adapter.source_name)
@@ -287,6 +327,7 @@ async def collect_anchors(
                 except (BudgetTrippedError, BudgetExhaustedError) as exc:
                     stage_errors.append(f"{adapter.source_name.value}:{exc}")
                     continue
+                adapters_run += 1
                 report.companies_attempted += 1
                 try:
                     signals = await adapter.fetch_current_anchor(target, context=context)
@@ -304,6 +345,7 @@ async def collect_anchors(
                         result.anchors_written += written_a
                 except AdapterGatedError as exc:
                     report.gated += 1
+                    adapters_gated += 1
                     breaker.record("gated")
                     stage_errors.append(f"{adapter.source_name.value} gated: {exc}")
                     _log.warning(
@@ -312,8 +354,25 @@ async def collect_anchors(
                         source=adapter.source_name.value,
                         error=repr(exc),
                     )
+                    if adapter.source_name is SourceName.linkedin_public:
+                        linkedin_gated_here = True
+                        if not _has_open_linkedin_gate_item(
+                            session, run_id=run.id, company_id=company.id
+                        ):
+                            writer.enqueue(
+                                EnqueueRequest(
+                                    company_id=company.id,
+                                    reason=ReviewReason.linkedin_gated,
+                                    priority=60,
+                                    detail=(f"run={run.id} source=linkedin_public reason={exc}")[
+                                        :2000
+                                    ],
+                                )
+                            )
+                            result.review_items_enqueued += 1
                 except AdapterFetchError as exc:
                     report.errors += 1
+                    adapters_failed += 1
                     breaker.record("error")
                     stage_errors.append(f"{adapter.source_name.value} error: {exc}")
                     _log.warning(
@@ -324,6 +383,7 @@ async def collect_anchors(
                     )
                 except Exception as exc:  # pragma: no cover - defensive
                     report.errors += 1
+                    adapters_failed += 1
                     breaker.record("error")
                     stage_errors.append(f"{adapter.source_name.value} unexpected: {exc!r}")
                     _log.error(
@@ -334,14 +394,27 @@ async def collect_anchors(
                     )
 
             stage_row.last_progress_at = datetime.now(tz=UTC)
-            if stage_errors and not any_signal:
+            if linkedin_gated_here:
+                result.linkedin_gated_companies += 1
+            if any_signal:
+                stage_row.status = CompanyRunStageStatus.succeeded
+                stage_row.last_error = "; ".join(stage_errors)[:2000] if stage_errors else None
+                result.companies_with_signals += 1
+                if stage_errors:
+                    result.errors.extend(stage_errors)
+            elif adapters_run > 0 and adapters_gated > 0 and adapters_failed == 0:
+                # Every adapter that ran was gated - degraded path. We
+                # distinguish gated from failed so operators can see at
+                # a glance which companies need manual review vs a
+                # code/network fix.
+                stage_row.status = CompanyRunStageStatus.gated
+                stage_row.last_error = "; ".join(stage_errors)[:2000]
+                result.companies_gated += 1
+                result.errors.extend(stage_errors)
+            elif stage_errors:
                 stage_row.status = CompanyRunStageStatus.failed
                 stage_row.last_error = "; ".join(stage_errors)[:2000]
                 result.errors.extend(stage_errors)
-            elif any_signal:
-                stage_row.status = CompanyRunStageStatus.succeeded
-                stage_row.last_error = None
-                result.companies_with_signals += 1
             else:
                 stage_row.status = CompanyRunStageStatus.succeeded
                 stage_row.last_error = None
@@ -349,8 +422,15 @@ async def collect_anchors(
 
     result.reports = reports
     run.finished_at = datetime.now(tz=UTC)
-    if result.errors and result.companies_with_signals == 0:
-        run.status = RunStatus.failed
+    if result.companies_with_signals == 0 and result.companies_attempted > 0:
+        # Distinguish "everyone walled" (partial, operator intervention)
+        # from "everyone crashed" (failed, likely a bug or outage).
+        if result.companies_gated > 0 and not any("error:" in line for line in result.errors):
+            run.status = RunStatus.partial
+        elif result.errors:
+            run.status = RunStatus.failed
+        else:
+            run.status = RunStatus.succeeded
     elif result.errors:
         run.status = RunStatus.partial
     else:
@@ -380,5 +460,13 @@ def default_http_configs() -> dict[SourceName, HttpClientConfig]:
             max_concurrency=2,
             cache_ttl_seconds=7 * 24 * 3600,
             default_headers={"Accept": "application/sparql-results+json"},
+        ),
+        SourceName.linkedin_public: HttpClientConfig(
+            user_agent=("Headcount-Estimator/0.1 (+internal-use; contact@example.com)"),
+            # Logged-out LinkedIn walls aggressive traffic: keep the
+            # concurrency at 1 and cache aggressively so re-runs are
+            # essentially free until the TTL rolls.
+            max_concurrency=1,
+            cache_ttl_seconds=settings.linkedin_public_company_ttl_days * 86400,
         ),
     }

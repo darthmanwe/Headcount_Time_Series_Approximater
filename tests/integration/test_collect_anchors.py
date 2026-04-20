@@ -17,12 +17,14 @@ from headcount.db.enums import (
     CompanyStatus,
     HeadcountValueKind,
     PriorityTier,
+    ReviewReason,
     RunStatus,
     SourceName,
 )
 from headcount.ingest.collect import collect_anchors
 from headcount.ingest.http import FileCache, HttpClient
 from headcount.ingest.observers import (
+    LinkedInPublicObserver,
     ManualAnchorObserver,
     SECObserver,
     WikidataObserver,
@@ -32,11 +34,13 @@ from headcount.models import (
     Company,
     CompanyAnchorObservation,
     CompanyRunStatus,
+    ReviewQueueItem,
     Run,
     SourceObservation,
 )
 
 FIXTURE_DIR = Path(__file__).resolve().parent.parent / "fixtures"
+LI_FIXTURE_DIR = FIXTURE_DIR / "linkedin"
 
 
 def _fixture(name: str) -> str:
@@ -238,3 +242,172 @@ async def test_collect_anchors_with_manual_observer_no_http(
     assert anchor.anchor_type is AnchorType.manual_anchor
     assert anchor.headcount_value_point == 164000.0
     assert anchor.confidence == pytest.approx(0.98)
+
+
+# -----------------------
+# LinkedIn degraded paths
+# -----------------------
+
+
+def _li_text(name: str) -> str:
+    return (LI_FIXTURE_DIR / name).read_text(encoding="utf-8")
+
+
+@pytest.fixture()
+def apple_with_linkedin(session: Session) -> Company:
+    company = Company(
+        canonical_name="Apple Inc.",
+        canonical_domain="apple.com",
+        linkedin_company_url="https://www.linkedin.com/company/apple/",
+        status=CompanyStatus.active,
+        priority_tier=PriorityTier.P0,
+    )
+    session.add(company)
+    session.commit()
+    return company
+
+
+@pytest.mark.asyncio
+async def test_linkedin_gated_plus_sec_success_is_partial_with_review_item(
+    session: Session, apple_with_linkedin: Company, tmp_path: Path
+) -> None:
+    """LinkedIn gates but SEC succeeds: stage=succeeded, review item enqueued."""
+    handler = _handler(
+        {
+            "https://www.sec.gov/files/company_tickers.json": (
+                200,
+                _fixture("sec_company_tickers.json"),
+            ),
+            "https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json": (
+                200,
+                _fixture("sec_apple_facts.json"),
+            ),
+            "https://www.linkedin.com/company/apple/": (
+                200,
+                _li_text("authwall.html"),
+            ),
+        }
+    )
+    cache = FileCache(tmp_path / "cache")
+    http = HttpClient(cache=cache, transport=httpx.MockTransport(handler))
+
+    result = await collect_anchors(
+        session,
+        adapters=[SECObserver(), LinkedInPublicObserver()],
+        companies=[apple_with_linkedin],
+        http_client=http,
+    )
+    session.commit()
+
+    assert result.companies_with_signals == 1
+    assert result.companies_gated == 0  # SEC still produced signals
+    assert result.linkedin_gated_companies == 1
+    assert result.review_items_enqueued == 1
+    assert result.anchors_written >= 3  # SEC historical anchors
+
+    stage_row = session.execute(select(CompanyRunStatus)).scalar_one()
+    assert stage_row.status is CompanyRunStageStatus.succeeded
+    # Gate reason is preserved in the stage row's last_error for audit
+    assert stage_row.last_error is not None
+    assert "linkedin_public gated" in stage_row.last_error
+
+    review_items = session.execute(select(ReviewQueueItem)).scalars().all()
+    assert len(review_items) == 1
+    assert review_items[0].review_reason is ReviewReason.linkedin_gated
+    assert review_items[0].company_id == apple_with_linkedin.id
+    assert "source=linkedin_public" in (review_items[0].detail or "")
+
+    run = session.execute(select(Run)).scalar_one()
+    # Errors list is populated (gate recorded) so run is partial, not succeeded.
+    assert run.status is RunStatus.partial
+
+
+@pytest.mark.asyncio
+async def test_linkedin_only_adapter_and_gated_marks_stage_gated(
+    session: Session, apple_with_linkedin: Company, tmp_path: Path
+) -> None:
+    handler = _handler(
+        {
+            "https://www.linkedin.com/company/apple/": (
+                200,
+                _li_text("authwall.html"),
+            ),
+        }
+    )
+    cache = FileCache(tmp_path / "cache")
+    http = HttpClient(cache=cache, transport=httpx.MockTransport(handler))
+
+    result = await collect_anchors(
+        session,
+        adapters=[LinkedInPublicObserver()],
+        companies=[apple_with_linkedin],
+        http_client=http,
+    )
+    session.commit()
+
+    assert result.companies_with_signals == 0
+    assert result.companies_gated == 1
+    assert result.linkedin_gated_companies == 1
+    assert result.review_items_enqueued == 1
+
+    stage_row = session.execute(select(CompanyRunStatus)).scalar_one()
+    assert stage_row.status is CompanyRunStageStatus.gated
+
+    run = session.execute(select(Run)).scalar_one()
+    assert run.status is RunStatus.partial
+
+
+@pytest.mark.asyncio
+async def test_linkedin_gate_review_item_is_idempotent_on_rerun(
+    session: Session, apple_with_linkedin: Company, tmp_path: Path
+) -> None:
+    handler = _handler(
+        {
+            "https://www.linkedin.com/company/apple/": (
+                200,
+                _li_text("authwall.html"),
+            ),
+        }
+    )
+    cache = FileCache(tmp_path / "cache")
+    http = HttpClient(cache=cache, transport=httpx.MockTransport(handler))
+
+    # First run creates the item; second run (same run_id) must not.
+    from datetime import UTC, datetime
+
+    from headcount.db.enums import RunKind
+
+    run = Run(
+        kind=RunKind.full,
+        status=RunStatus.running,
+        started_at=datetime.now(tz=UTC),
+        cutoff_month=datetime.now(tz=UTC).date().replace(day=1),
+        method_version="hc-v1",
+        anchor_policy_version="anchor-v1",
+        coverage_curve_version="coverage-v1",
+        config_hash="test-rerun",
+    )
+    session.add(run)
+    session.commit()
+
+    result_a = await collect_anchors(
+        session,
+        adapters=[LinkedInPublicObserver()],
+        companies=[apple_with_linkedin],
+        http_client=http,
+        run=run,
+    )
+    session.commit()
+    result_b = await collect_anchors(
+        session,
+        adapters=[LinkedInPublicObserver()],
+        companies=[apple_with_linkedin],
+        http_client=http,
+        run=run,
+    )
+    session.commit()
+
+    assert result_a.review_items_enqueued == 1
+    assert result_b.review_items_enqueued == 0
+    items = session.execute(select(ReviewQueueItem)).scalars().all()
+    assert len(items) == 1

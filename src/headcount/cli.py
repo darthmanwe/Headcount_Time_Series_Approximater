@@ -275,6 +275,7 @@ def collect_anchors(
     from headcount.ingest.http import FileCache, HttpClient
     from headcount.ingest.observers import (
         CompanyWebObserver,
+        LinkedInPublicObserver,
         ManualAnchorObserver,
         SECObserver,
         WikidataObserver,
@@ -289,13 +290,19 @@ def collect_anchors(
         if source
         else [SourceName.manual, SourceName.sec, SourceName.wikidata]
     )
-    if not live and SourceName.company_web in requested:
-        log.warning(
-            "company_web_requires_live",
-            message="company_web scraping is disabled unless --live is set",
-        )
-        requested = [s for s in requested if s is not SourceName.company_web]
+    # Live-only sources: make this explicit so nobody accidentally fans
+    # out logged-out LinkedIn scrapes (or company-web crawls) during a
+    # test/smoke run.
+    _live_only = {SourceName.company_web, SourceName.linkedin_public}
     if not live:
+        dropped = [s for s in requested if s in _live_only]
+        for s in dropped:
+            log.warning(
+                "source_requires_live",
+                source=s.value,
+                message=f"{s.value} is disabled unless --live is set",
+            )
+        requested = [s for s in requested if s not in _live_only]
         typer.echo("running in offline mode: only fixture/manual sources will execute")
 
     adapters: list[object] = []
@@ -310,6 +317,8 @@ def collect_anchors(
             adapters.append(WikidataObserver())
         elif src is SourceName.company_web:
             adapters.append(CompanyWebObserver())
+        elif src is SourceName.linkedin_public:
+            adapters.append(LinkedInPublicObserver())
         else:
             log.warning("unknown_source_ignored", source=src.value)
 
@@ -345,6 +354,9 @@ def collect_anchors(
     typer.echo(
         f"run={summary['run_id']} companies={summary['companies_attempted']} "
         f"with-signals={summary['companies_with_signals']} "
+        f"gated={summary['companies_gated']} "
+        f"linkedin-gated={summary['linkedin_gated_companies']} "
+        f"review-items={summary['review_items_enqueued']} "
         f"signals={summary['signals_written']} anchors={summary['anchors_written']} "
         f"errors={summary['errors']}"
     )
