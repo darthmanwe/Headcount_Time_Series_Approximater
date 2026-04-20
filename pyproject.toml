@@ -1,0 +1,92 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "headcount"
+version = "0.1.0"
+description = "Internal-use, evidence-driven headcount time series estimator"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+authors = [{ name = "Internal" }]
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "typer>=0.12",
+  "sqlalchemy>=2.0",
+  "alembic>=1.13",
+  "pydantic>=2.7",
+  "pydantic-settings>=2.3",
+  "httpx[http2]>=0.27",
+  "beautifulsoup4>=4.12",
+  "lxml>=5.2",
+  "duckdb>=1.0",
+  "pandas>=2.2",
+  "polars>=1.0",
+  "openpyxl>=3.1",
+  "python-dateutil>=2.9",
+  "structlog>=24.1",
+  "prometheus-client>=0.20",
+  "pyyaml>=6.0",
+  "sparqlwrapper>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2",
+  "pytest-cov>=5.0",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.5",
+  "mypy>=1.10",
+  "types-python-dateutil",
+  "types-PyYAML",
+]
+browser = [
+  "playwright>=1.44",
+]
+review = [
+  "streamlit>=1.36",
+  "plotly>=5.22",
+]
+
+[project.scripts]
+hc = "headcount.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["headcount*"]
+
+[tool.setuptools.package-data]
+"headcount" = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "E", "F", "W", "I", "B", "UP", "C4", "SIM", "RUF",
+]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B008", "SIM117"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+files = ["src/headcount"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"
+asyncio_mode = "auto"
+filterwarnings = [
+  "error",
+  "ignore::DeprecationWarning",
+]
