@@ -136,6 +136,13 @@ class OverrideRow(_StrictModel):
     created_at: datetime
 
 
+class ReviewTransitionRequest(_StrictModel):
+    status: str
+    assigned_to: str | None = None
+    note: str | None = None
+    actor_id: str | None = None
+
+
 class OverrideCreateRequest(_StrictModel):
     company_id: str
     field_name: OverrideField
@@ -164,6 +171,21 @@ def _company_summary(c: Company) -> CompanySummary:
         canonical_domain=c.canonical_domain,
         priority_tier=c.priority_tier.value,
         status=c.status.value,
+    )
+
+
+def _review_row(item: ReviewQueueItem, company: Company) -> ReviewQueueRow:
+    return ReviewQueueRow(
+        id=item.id,
+        company_id=company.id,
+        canonical_name=company.canonical_name,
+        review_reason=item.review_reason.value,
+        priority=int(item.priority),
+        status=item.status.value,
+        detail=item.detail,
+        assigned_to=item.assigned_to,
+        estimate_version_id=item.estimate_version_id,
+        updated_at=item.updated_at,
     )
 
 
@@ -401,21 +423,78 @@ def create_app(session_factory: Any | None = None) -> FastAPI:
             stmt = stmt.where(ReviewQueueItem.status == enum)
         out: list[ReviewQueueRow] = []
         for item, company in session.execute(stmt).all():
-            out.append(
-                ReviewQueueRow(
-                    id=item.id,
-                    company_id=company.id,
-                    canonical_name=company.canonical_name,
-                    review_reason=item.review_reason.value,
-                    priority=int(item.priority),
-                    status=item.status.value,
-                    detail=item.detail,
-                    assigned_to=item.assigned_to,
-                    estimate_version_id=item.estimate_version_id,
-                    updated_at=item.updated_at,
-                )
-            )
+            out.append(_review_row(item, company))
         return out
+
+    @app.post(
+        "/review-queue/{item_id}/transition",
+        tags=["review"],
+        response_model=ReviewQueueRow,
+    )
+    def transition_review_item(
+        item_id: str,
+        body: ReviewTransitionRequest,
+        session: Session = Depends(get_session),
+    ) -> ReviewQueueRow:
+        """Move a review queue row between states.
+
+        The UI uses this for *claim* (``open -> assigned`` with
+        ``assigned_to``) and *resolve/dismiss* (``* -> resolved`` or
+        ``* -> dismissed``). Every transition writes an audit entry so we
+        have a paper trail of who touched which item and why.
+        """
+
+        item = session.get(ReviewQueueItem, item_id)
+        if item is None:
+            raise HTTPException(
+                status_code=404, detail=f"review item not found: {item_id}"
+            )
+        try:
+            target = ReviewStatus(body.status)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"unknown status: {body.status}"
+            ) from exc
+        previous = item.status
+        item.status = target
+        if target is ReviewStatus.assigned:
+            if not body.assigned_to:
+                raise HTTPException(
+                    status_code=400,
+                    detail="assigned_to is required when transitioning to 'assigned'",
+                )
+            item.assigned_to = body.assigned_to
+        elif target in (ReviewStatus.resolved, ReviewStatus.dismissed):
+            item.resolved_at = datetime.now(tz=UTC)
+        elif target is ReviewStatus.open:
+            item.assigned_to = None
+            item.resolved_at = None
+        record_audit(
+            session,
+            actor_type="api",
+            actor_id=body.actor_id or body.assigned_to,
+            action="review_transition",
+            target_type="review_queue_item",
+            target_id=item.id,
+            payload={
+                "company_id": item.company_id,
+                "from": previous.value,
+                "to": target.value,
+                "assigned_to": item.assigned_to,
+                "note": body.note,
+            },
+        )
+        session.commit()
+        session.refresh(item)
+        company = session.get(Company, item.company_id)
+        assert company is not None  # FK guarantees this
+        log.info(
+            "review_transition",
+            review_id=item.id,
+            company_id=item.company_id,
+            **{"from": previous.value, "to": target.value},
+        )
+        return _review_row(item, company)
 
     @app.get("/overrides", tags=["overrides"], response_model=list[OverrideRow])
     def list_overrides(

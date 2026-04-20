@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import subprocess
 import sys
 
@@ -59,6 +60,7 @@ def test_cli_help_lists_all_stage_commands() -> None:
         "rerun-company",
         "status",
         "serve",
+        "review-ui",
         "version",
         "config",
     ):
@@ -97,11 +99,18 @@ def test_api_healthz_and_metrics() -> None:
 
 def test_hc_help_entry_point_runs() -> None:
     """Running ``python -m headcount.cli --help`` must exit cleanly."""
+    # Force utf-8 decoding: the Typer/Rich help output includes Unicode
+    # box-drawing characters that cp1252 (Windows default) can't decode,
+    # which otherwise crashes subprocess's reader thread.
     result = subprocess.run(
         [sys.executable, "-m", "headcount.cli", "--help"],
         capture_output=True,
         text=True,
         check=False,
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
     )
     assert result.returncode == 0, result.stderr
-    assert "hc" in result.stdout.lower() or "usage" in result.stdout.lower()
+    stdout = result.stdout or ""
+    assert "hc" in stdout.lower() or "usage" in stdout.lower()

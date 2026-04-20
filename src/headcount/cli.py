@@ -1067,6 +1067,59 @@ def serve_cmd(
     )
 
 
+@app.command("review-ui")
+def review_ui_cmd(
+    host: Annotated[
+        str, typer.Option("--host", help="Bind host for Streamlit.")
+    ] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", help="Bind port.")] = 8501,
+    api_url: Annotated[
+        str | None,
+        typer.Option(
+            "--api-url",
+            help="FastAPI base URL the UI should talk to. "
+            "Also sets HEADCOUNT_API_URL in the subprocess env.",
+        ),
+    ] = None,
+) -> None:
+    """Start the Streamlit review UI (Phase 10, ``streamlit run``)."""
+
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    script = (
+        Path(__file__).resolve().parents[2] / "apps" / "review_ui" / "app.py"
+    )
+    if not script.exists():
+        raise typer.BadParameter(f"review UI entry not found at {script}")
+    env = os.environ.copy()
+    if api_url:
+        env["HEADCOUNT_API_URL"] = api_url
+    log = get_logger("headcount.cli.review_ui")
+    log.info(
+        "review_ui_starting",
+        host=host,
+        port=port,
+        api_url=env.get("HEADCOUNT_API_URL"),
+    )
+    cmd = [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        str(script),
+        "--server.address",
+        host,
+        "--server.port",
+        str(port),
+        "--server.headless",
+        "true",
+    ]
+    subprocess.run(cmd, env=env, check=True)
+
+
 @app.command("version")
 def version_cmd() -> None:
     """Print version and exit."""

@@ -201,6 +201,68 @@ def test_review_queue(client: TestClient, session_factory: sessionmaker[Session]
     assert rows[0]["canonical_name"] == "Acme Inc"
 
 
+def test_review_queue_transition_claim_and_resolve(
+    client: TestClient, session_factory: sessionmaker[Session]
+) -> None:
+    with session_factory() as session:
+        company = _seed(session)
+        item = ReviewQueueItem(
+            company_id=company.id,
+            review_reason=ReviewReason.low_confidence,
+            priority=80,
+            status=ReviewStatus.open,
+            detail="needs eyes",
+        )
+        session.add(item)
+        session.commit()
+        item_id = item.id
+
+    # Claim (open -> assigned)
+    resp = client.post(
+        f"/review-queue/{item_id}/transition",
+        json={"status": "assigned", "assigned_to": "alice", "note": "taking a look"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "assigned"
+    assert body["assigned_to"] == "alice"
+
+    # Resolve (assigned -> resolved)
+    resp = client.post(
+        f"/review-queue/{item_id}/transition",
+        json={"status": "resolved", "note": "fixed via override", "actor_id": "alice"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "resolved"
+
+    # Audit log captures both transitions.
+    audits = client.get(
+        "/audit",
+        params={"target_type": "review_queue_item", "target_id": item_id},
+    ).json()
+    actions = {(a["payload"]["from"], a["payload"]["to"]) for a in audits}
+    assert ("open", "assigned") in actions
+    assert ("assigned", "resolved") in actions
+
+    # 404 on unknown item.
+    missing = client.post(
+        "/review-queue/does-not-exist/transition", json={"status": "resolved"}
+    )
+    assert missing.status_code == 404
+
+    # 400 on bad status.
+    bad = client.post(
+        f"/review-queue/{item_id}/transition", json={"status": "nonsense"}
+    )
+    assert bad.status_code == 400
+
+    # 400 on assigned without assigned_to.
+    bad_assign = client.post(
+        f"/review-queue/{item_id}/transition", json={"status": "assigned"}
+    )
+    assert bad_assign.status_code == 400
+
+
 def test_runs_list_and_detail(
     client: TestClient, session_factory: sessionmaker[Session]
 ) -> None:
