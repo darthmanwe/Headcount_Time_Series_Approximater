@@ -127,10 +127,11 @@ def test_promotes_headcount_rows_to_historical_anchors(session: Session) -> None
     assert by_month[today].anchor_type is AnchorType.current_headcount_anchor
     assert by_month[date(2025, 10, 1)].anchor_type is AnchorType.historical_statement
     assert by_month[date(2025, 4, 1)].anchor_type is AnchorType.historical_statement
-    # Analyst-verified (``zeeshan``) outranks automated third-party
-    # feeds (``harmonic``) in our policy: when both providers report a
-    # value at the same month, the analyst's number wins.
-    assert by_month[date(2025, 4, 1)].confidence > by_month[today].confidence
+    # Harmonic is the signal we are trying to approximate and therefore
+    # outranks the other providers in promotion: when both Harmonic and
+    # Zeeshan report a value for the same (company, month), Harmonic's
+    # anchor wins the tie.
+    assert by_month[today].confidence > by_month[date(2025, 4, 1)].confidence
 
     sources = list(session.execute(select(SourceObservation)).scalars())
     assert len(sources) == 3

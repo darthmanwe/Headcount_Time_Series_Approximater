@@ -47,11 +47,40 @@ Possible anchor sources:
 - public company self-statement
 - manual analyst anchor
 - free-tier API anchor
+- third-party benchmark feed (Harmonic.ai)
 
 Assumptions:
 - the current anchor is more trustworthy than historical inferred values
 - multiple anchors may exist and disagree
 - anchor selection should be explicit and explainable
+
+### 4.1 Provider trust ordering
+
+The benchmark workbook ships with three providers and they are not
+equally trustworthy *for our purposes*. The product goal is "match
+Harmonic for the calibration cohort, then run our own pipeline for
+the long tail Harmonic does not cover", which dictates the trust
+hierarchy:
+
+| Provider | Trust floor | Role |
+| --- | --- | --- |
+| `harmonic` | `0.70` | Target signal — what we are explicitly trying to approximate. Wins promotion at the current month. |
+| `zeeshan` | `0.55` | Supporting evidence — automated service, useful for ranges, historical points (Harmonic does not emit them), and 2y growth (Harmonic does not emit it). |
+| `linkedin` | `0.45` | Trend / tie-break only — profile-appearance counts, noisy at the level. |
+
+These floors live in
+`src/headcount/parsers/benchmark_anchors.py::_PROVIDER_CONFIDENCE`
+and are the deciding tie-breaker inside
+`headcount.estimate.reconcile.interpolate_series_from_anchors`
+when two providers report a value for the same `(company, month)`.
+
+The Harmonic cohort is small (~25 companies in the reference
+workbook). It is used as a *calibration lens* — every headline KPI
+in the evaluation scoreboard is computed against this cohort.
+For companies outside the cohort we fall back on the (Zeeshan +
+LinkedIn + pipeline) stack and report coverage / confidence-band
+distribution rather than absolute accuracy. See `docs/EVALUATION_V1.md`
+for the full evaluation policy.
 
 ## 5. Employment interval assumptions
 

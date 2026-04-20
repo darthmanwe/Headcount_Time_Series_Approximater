@@ -1136,7 +1136,7 @@ def evaluate_cmd(
         )
 
     headline_mape = scoreboard.headline_mape()
-    headline_mae = scoreboard.headline_growth_mae()
+    headline_mae = scoreboard.headline_growth_mae("1y")
     log.info(
         "evaluate_done",
         evaluation_run_id=evaluation_id,

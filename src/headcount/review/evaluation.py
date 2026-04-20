@@ -11,6 +11,28 @@ database state it produces a :class:`Scoreboard` that captures
 * per-provider growth-window error (``growth_6m_pct`` / ``1y`` / ``2y``)
 * review queue state + confidence band distribution
 * top per-company disagreements, with workbook/sheet/row provenance
+* rank correlation against the primary provider (how close is our
+  *ordering* of companies by growth to theirs?)
+
+Target signal
+-------------
+
+The product goal is "approximate Harmonic.ai's numbers as closely as
+possible for the companies where Harmonic is available, then rely on
+our own pipeline for the ~99% of companies Harmonic never sees". That
+shapes this module:
+
+* **Primary provider is Harmonic.** The headline MAPE, headline
+  growth MAE, and ``high_confidence_disagreements`` trip are all
+  Harmonic-driven. Zeeshan/LinkedIn numbers are reported as
+  supporting metrics.
+* **Harmonic-cohort vs. full-population are reported separately.**
+  The Harmonic cohort is the calibration lens (small, ~25 companies);
+  the full population is the production coverage signal. Mixing them
+  hides the whole point of having a small calibration set.
+* **2y growth falls back to Zeeshan** because Harmonic does not emit
+  it. That metric is labelled ``primary_provider: zeeshan`` in the
+  output so downstream consumers can weight it accordingly.
 
 Design choices
 --------------
@@ -23,11 +45,12 @@ Design choices
   state produce byte-identical scoreboards modulo the optional
   ``evaluated_at`` tag.
 * **Provider-aware**: each accuracy bucket keeps the provider in its
-  key so we can tell "analyst agrees, Harmonic disagrees" apart from
+  key so we can tell "Harmonic agrees, Zeeshan disagrees" apart from
   "everybody disagrees".
 * **Interval-aware**: when the benchmark row carries an interval
   (Zeeshan's range buckets, 201-500), we count the estimate as "in
   the range" rather than penalising for not hitting the midpoint.
+  This applies regardless of which provider is primary.
 * **Fail-closed**: if a denominator would be zero (no benchmark rows
   for a metric, no in-scope companies) we emit ``None`` and record the
   sample size, never a fabricated zero.
@@ -57,7 +80,17 @@ from headcount.models.headcount_estimate_monthly import HeadcountEstimateMonthly
 from headcount.models.review_queue_item import ReviewQueueItem
 from headcount.utils.logging import get_logger
 
-EVALUATION_VERSION = "eval_v1"
+EVALUATION_VERSION = "eval_v2"
+# Primary provider whose numbers we are trying to approximate. The
+# Harmonic-cohort stats, headline KPIs, and high-confidence disagreement
+# tripwire are all driven from rows whose ``provider`` equals this.
+PRIMARY_PROVIDER = "harmonic"
+# Supporting providers - their accuracy is reported but never trips the
+# acceptance gate.
+SUPPORTING_PROVIDERS: tuple[str, ...] = ("zeeshan", "linkedin")
+# 2y growth is not emitted by Harmonic in the reference workbook, so
+# that horizon falls back to Zeeshan for headline purposes.
+_FALLBACK_PROVIDER_FOR_2Y = "zeeshan"
 
 _log = get_logger("headcount.review.evaluation")
 
@@ -97,6 +130,10 @@ class EvaluationConfig:
     # A "high-confidence disagreement" is a row whose estimate
     # ``confidence_band`` is ``high`` or ``medium`` but whose value
     # differs from the benchmark by more than this ratio (100% = 2x).
+    # Only rows whose provider matches :data:`PRIMARY_PROVIDER`
+    # (Harmonic) count toward the tripwire; supporting-provider
+    # disagreements are tracked in ``supporting_disagreements`` but
+    # never block the acceptance gate.
     high_confidence_disagreement_ratio: float = 1.0
     # Interval-aware: if both estimate and benchmark carry intervals
     # and they overlap, we credit the estimate as "in range" and do
@@ -130,11 +167,7 @@ class MetricBucket:
         return {
             "n": self.n,
             "mae": round(statistics.fmean(self.errors_abs), 4),
-            "mape": (
-                round(statistics.fmean(self.errors_pct), 4)
-                if self.errors_pct
-                else None
-            ),
+            "mape": (round(statistics.fmean(self.errors_pct), 4) if self.errors_pct else None),
             "median_abs_error": round(statistics.median(self.errors_abs), 4),
         }
 
@@ -184,12 +217,20 @@ class Scoreboard:
     companies_with_benchmark: int
     coverage_in_scope: float
     coverage_with_benchmark: float
+    # Harmonic cohort = the small set of companies where we actually
+    # have a Harmonic benchmark row; this is the calibration lens.
+    harmonic_cohort_size: int
+    harmonic_cohort_evaluated: int
     # ``accuracy[provider][metric] -> summary dict``
     accuracy: dict[str, dict[str, dict[str, float | int | None]]]
     growth_accuracy: dict[str, dict[str, dict[str, float | int | None]]]
+    # ``rank_correlation[provider][horizon] -> spearman rho`` over the
+    # provider's cohort. ``None`` when the cohort is too small (< 3).
+    rank_correlation: dict[str, dict[str, float | None]]
     confidence_bands: dict[str, int]
     review_queue_open: int
     high_confidence_disagreements: int
+    supporting_disagreements: int
     top_disagreements: list[Disagreement]
     evaluated_at: str | None = None
     estimate_run_id: str | None = None
@@ -200,6 +241,8 @@ class Scoreboard:
             "as_of_month": self.as_of_month.isoformat(),
             "evaluated_at": self.evaluated_at,
             "estimate_run_id": self.estimate_run_id,
+            "primary_provider": PRIMARY_PROVIDER,
+            "supporting_providers": list(SUPPORTING_PROVIDERS),
             "companies": {
                 "in_scope": self.companies_in_scope,
                 "evaluated": self.companies_evaluated,
@@ -209,29 +252,72 @@ class Scoreboard:
                 "in_scope": round(self.coverage_in_scope, 4),
                 "with_benchmark": round(self.coverage_with_benchmark, 4),
             },
+            "harmonic_cohort": {
+                "size": self.harmonic_cohort_size,
+                "evaluated": self.harmonic_cohort_evaluated,
+                "coverage": (
+                    round(
+                        self.harmonic_cohort_evaluated / self.harmonic_cohort_size,
+                        4,
+                    )
+                    if self.harmonic_cohort_size
+                    else 0.0
+                ),
+            },
+            "headline": {
+                "mape_headcount_current": self.headline_mape(),
+                "mae_growth_6m_pct": self.headline_growth_mae("6m"),
+                "mae_growth_1y_pct": self.headline_growth_mae("1y"),
+                "mae_growth_2y_pct": self.headline_growth_mae("2y"),
+                "spearman_growth_6m": self.headline_spearman("6m"),
+                "spearman_growth_1y": self.headline_spearman("1y"),
+            },
             "accuracy": self.accuracy,
             "growth_accuracy": self.growth_accuracy,
+            "rank_correlation": self.rank_correlation,
             "confidence_bands": self.confidence_bands,
             "review": {
                 "queue_open": self.review_queue_open,
                 "high_confidence_disagreements": self.high_confidence_disagreements,
+                "supporting_disagreements": self.supporting_disagreements,
             },
             "top_disagreements": [d.to_dict() for d in self.top_disagreements],
         }
 
     def headline_mape(self) -> float | None:
-        """Zeeshan ``headcount_current`` MAPE - the headline accuracy KPI."""
+        """Harmonic ``headcount_current`` MAPE - primary accuracy KPI."""
 
-        row = self.accuracy.get("zeeshan", {}).get("headcount_current", {})
+        row = self.accuracy.get(PRIMARY_PROVIDER, {}).get("headcount_current", {})
         mape = row.get("mape")
         return float(mape) if mape is not None else None
 
-    def headline_growth_mae(self) -> float | None:
-        """Zeeshan ``1y`` growth MAE - headline growth-accuracy KPI."""
+    def headline_growth_mae(self, horizon: str) -> float | None:
+        """Headline growth MAE at ``horizon`` (``"6m"`` / ``"1y"`` / ``"2y"``).
 
-        row = self.growth_accuracy.get("zeeshan", {}).get("1y", {})
+        Horizons Harmonic emits fall back to Zeeshan only when Harmonic
+        has no coverage at all; the ``2y`` horizon is Zeeshan-only by
+        design (Harmonic does not emit a 2y percentage).
+        """
+
+        provider = _FALLBACK_PROVIDER_FOR_2Y if horizon == "2y" else PRIMARY_PROVIDER
+        row = self.growth_accuracy.get(provider, {}).get(horizon, {})
         mae = row.get("mae")
+        if mae is None and provider == PRIMARY_PROVIDER:
+            row = self.growth_accuracy.get(_FALLBACK_PROVIDER_FOR_2Y, {}).get(horizon, {})
+            mae = row.get("mae")
         return float(mae) if mae is not None else None
+
+    def headline_spearman(self, horizon: str) -> float | None:
+        """Spearman rank correlation on Harmonic's growth ordering.
+
+        A high rho here means we are sorting companies by growth the
+        same way Harmonic does, even when our absolute numbers drift.
+        That ordering is what prospect-prioritization care about.
+        """
+
+        row = self.rank_correlation.get(PRIMARY_PROVIDER, {})
+        rho = row.get(horizon)
+        return float(rho) if rho is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +343,48 @@ def _intervals_overlap(
     if b_min is None or b_max is None:
         return False
     return not (a_max < b_min or b_max < a_min)
+
+
+def _spearman_rho(xs: Sequence[float], ys: Sequence[float]) -> float | None:
+    """Return Spearman rank correlation between ``xs`` and ``ys``.
+
+    Returns ``None`` when fewer than 3 observations are available
+    (below that size the coefficient is not interpretable for our
+    "are we sorting the same way?" question) or when either input
+    has zero variance after ranking.
+    """
+
+    if len(xs) != len(ys):
+        raise ValueError("xs and ys must be the same length")
+    n = len(xs)
+    if n < 3:
+        return None
+
+    def _ranks(values: Sequence[float]) -> list[float]:
+        # Average-rank tie handling.
+        indexed = sorted(range(n), key=lambda i: values[i])
+        ranks = [0.0] * n
+        i = 0
+        while i < n:
+            j = i
+            while j + 1 < n and values[indexed[j + 1]] == values[indexed[i]]:
+                j += 1
+            avg = (i + j) / 2.0 + 1.0  # 1-indexed rank average
+            for k in range(i, j + 1):
+                ranks[indexed[k]] = avg
+            i = j + 1
+        return ranks
+
+    rx = _ranks(xs)
+    ry = _ranks(ys)
+    mean_x = sum(rx) / n
+    mean_y = sum(ry) / n
+    cov = sum((rx[i] - mean_x) * (ry[i] - mean_y) for i in range(n))
+    var_x = sum((r - mean_x) ** 2 for r in rx)
+    var_y = sum((r - mean_y) ** 2 for r in ry)
+    if var_x == 0.0 or var_y == 0.0:
+        return None
+    return float(cov / ((var_x**0.5) * (var_y**0.5)))
 
 
 def _load_latest_estimates(
@@ -347,35 +475,32 @@ def evaluate_against_benchmarks(
         scope_ids = [str(x) for x in company_ids if x]
         scope_rows = list(
             session.execute(
-                select(Company.id, Company.canonical_name).where(
-                    Company.id.in_(scope_ids)
-                )
+                select(Company.id, Company.canonical_name).where(Company.id.in_(scope_ids))
             )
         )
     else:
-        scope_rows = list(
-            session.execute(select(Company.id, Company.canonical_name))
-        )
+        scope_rows = list(session.execute(select(Company.id, Company.canonical_name)))
     company_names: dict[str, str] = {row[0]: row[1] for row in scope_rows}
     scope_set = set(company_names.keys())
 
-    estimates_by_company = _load_latest_estimates(session, company_ids=scope_ids if company_ids else None)
+    estimates_by_company = _load_latest_estimates(
+        session, company_ids=scope_ids if company_ids else None
+    )
 
-    bench_stmt = select(BenchmarkObservation).where(
-        BenchmarkObservation.company_id.is_not(None)
-    )
+    bench_stmt = select(BenchmarkObservation).where(BenchmarkObservation.company_id.is_not(None))
     if company_ids:
-        bench_stmt = bench_stmt.where(
-            BenchmarkObservation.company_id.in_(list(scope_set))
-        )
-    benchmarks_by_company = _group_benchmarks(
-        session.execute(bench_stmt).scalars()
-    )
+        bench_stmt = bench_stmt.where(BenchmarkObservation.company_id.in_(list(scope_set)))
+    benchmarks_by_company = _group_benchmarks(session.execute(bench_stmt).scalars())
 
     accuracy: dict[str, dict[str, MetricBucket]] = {}
     growth_accuracy: dict[str, dict[str, MetricBucket]] = {}
+    # ``growth_pairs[provider][horizon] -> list[(estimate_ratio, benchmark_ratio)]``
+    # collected once per (company, provider, horizon) so rank correlation
+    # has one point per company, not one per benchmark row.
+    growth_pairs: dict[str, dict[str, list[tuple[float, float]]]] = {}
     disagreements: list[Disagreement] = []
     high_confidence_disagreement_count = 0
+    supporting_disagreement_count = 0
     confidence_bands: dict[str, int] = {band.value: 0 for band in ConfidenceBand}
 
     companies_evaluated = 0
@@ -388,9 +513,17 @@ def evaluate_against_benchmarks(
                     confidence_bands.get(est.confidence_band.value, 0) + 1
                 )
 
-    companies_with_benchmark = sum(
-        1 for cid in scope_set if benchmarks_by_company.get(cid)
-    )
+    companies_with_benchmark = sum(1 for cid in scope_set if benchmarks_by_company.get(cid))
+
+    # Harmonic cohort = companies in scope with at least one Harmonic
+    # benchmark row. This is the calibration lens the rest of the
+    # scoreboard revolves around.
+    harmonic_cohort: set[str] = {
+        cid
+        for cid, benches in benchmarks_by_company.items()
+        if cid in scope_set and any(b.provider.value == PRIMARY_PROVIDER for b in benches)
+    }
+    harmonic_cohort_evaluated = sum(1 for cid in harmonic_cohort if estimates_by_company.get(cid))
 
     for cid, benches in benchmarks_by_company.items():
         if cid not in scope_set:
@@ -412,20 +545,39 @@ def evaluate_against_benchmarks(
                 cfg=cfg,
                 accuracy=accuracy,
                 growth_accuracy=growth_accuracy,
+                growth_pairs=growth_pairs,
                 disagreements=disagreements,
             )
 
-    # Count high-confidence disagreements after the fact so we can
-    # threshold on the ratio specifically.
+    # Count disagreements by tier after the fact so we can threshold
+    # on both ratio and provider. Only :data:`PRIMARY_PROVIDER`
+    # (Harmonic) trips the acceptance gate; supporting-provider
+    # disagreements are tracked separately for diagnostic purposes.
     for d in disagreements:
         if (
             d.confidence_band in {ConfidenceBand.high.value, ConfidenceBand.medium.value}
             and d.abs_ratio >= cfg.high_confidence_disagreement_ratio
         ):
-            high_confidence_disagreement_count += 1
+            if d.provider == PRIMARY_PROVIDER:
+                high_confidence_disagreement_count += 1
+            else:
+                supporting_disagreement_count += 1
 
     disagreements.sort(key=lambda d: d.abs_ratio, reverse=True)
     top = disagreements[: cfg.top_disagreements_limit]
+
+    rank_correlation: dict[str, dict[str, float | None]] = {}
+    for provider_key, by_horizon in growth_pairs.items():
+        per_horizon: dict[str, float | None] = {}
+        for horizon, pairs in by_horizon.items():
+            if not pairs:
+                per_horizon[horizon] = None
+                continue
+            xs = [p[0] for p in pairs]
+            ys = [p[1] for p in pairs]
+            rho = _spearman_rho(xs, ys)
+            per_horizon[horizon] = round(rho, 4) if rho is not None else None
+        rank_correlation[provider_key] = per_horizon
 
     review_queue_open = int(
         session.execute(
@@ -435,9 +587,7 @@ def evaluate_against_benchmarks(
         ).scalar_one()
     )
 
-    coverage_in_scope = (
-        companies_evaluated / len(scope_set) if scope_set else 0.0
-    )
+    coverage_in_scope = companies_evaluated / len(scope_set) if scope_set else 0.0
     coverage_with_benchmark = (
         sum(
             1
@@ -457,6 +607,8 @@ def evaluate_against_benchmarks(
         companies_with_benchmark=companies_with_benchmark,
         coverage_in_scope=round(coverage_in_scope, 4),
         coverage_with_benchmark=round(coverage_with_benchmark, 4),
+        harmonic_cohort_size=len(harmonic_cohort),
+        harmonic_cohort_evaluated=harmonic_cohort_evaluated,
         accuracy={
             provider: {metric: bucket.summary() for metric, bucket in by_metric.items()}
             for provider, by_metric in accuracy.items()
@@ -465,9 +617,11 @@ def evaluate_against_benchmarks(
             provider: {metric: bucket.summary() for metric, bucket in by_metric.items()}
             for provider, by_metric in growth_accuracy.items()
         },
+        rank_correlation=rank_correlation,
         confidence_bands=confidence_bands,
         review_queue_open=review_queue_open,
         high_confidence_disagreements=high_confidence_disagreement_count,
+        supporting_disagreements=supporting_disagreement_count,
         top_disagreements=top,
         evaluated_at=evaluated_at.isoformat() if evaluated_at is not None else None,
         estimate_run_id=estimate_run_id,
@@ -485,6 +639,7 @@ def _score_one_benchmark_row(
     cfg: EvaluationConfig,
     accuracy: dict[str, dict[str, MetricBucket]],
     growth_accuracy: dict[str, dict[str, MetricBucket]],
+    growth_pairs: dict[str, dict[str, list[tuple[float, float]]]],
     disagreements: list[Disagreement],
 ) -> None:
     provider = bench.provider.value
@@ -504,9 +659,7 @@ def _score_one_benchmark_row(
         if est is None:
             return
         bucket = accuracy.setdefault(provider, {}).setdefault(metric.value, MetricBucket())
-        overlap = _intervals_overlap(
-            est.value_min, est.value_max, bench.value_min, bench.value_max
-        )
+        overlap = _intervals_overlap(est.value_min, est.value_max, bench.value_min, bench.value_max)
         if cfg.credit_interval_overlap and overlap:
             bucket.n += 1
             # Interval overlap = zero error for accuracy math.
@@ -549,7 +702,11 @@ def _score_one_benchmark_row(
         # Benchmark is a percentage like 5.1 meaning +5.1%; growth_point
         # is a ratio like 0.051. Convert benchmark to ratio to compare.
         bench_ratio = float(value_point) / 100.0
-        bucket.add_point(estimate=float(point.value_point), benchmark=bench_ratio)
+        estimate_ratio = float(point.value_point)
+        bucket.add_point(estimate=estimate_ratio, benchmark=bench_ratio)
+        growth_pairs.setdefault(provider, {}).setdefault(label, []).append(
+            (estimate_ratio, bench_ratio)
+        )
 
 
 def persist_scoreboard(
@@ -558,23 +715,43 @@ def persist_scoreboard(
     *,
     note: str | None = None,
 ) -> str:
-    """Insert an :class:`EvaluationRun` row and return its ``id``."""
+    """Insert an :class:`EvaluationRun` row and return its ``id``.
+
+    The denormalised headline columns are populated from the primary
+    provider (Harmonic); the full per-provider detail lives in
+    ``scoreboard_json`` for UI and API consumers.
+    """
 
     from headcount.models.evaluation_run import EvaluationRun
+
+    def _provider_mape(provider: str) -> float | None:
+        row = scoreboard.accuracy.get(provider, {}).get("headcount_current", {})
+        mape = row.get("mape")
+        return float(mape) if mape is not None else None
 
     row = EvaluationRun(
         estimate_run_id=scoreboard.estimate_run_id,
         as_of_month=scoreboard.as_of_month,
         evaluation_version=scoreboard.evaluation_version,
+        primary_provider=PRIMARY_PROVIDER,
         companies_in_scope=scoreboard.companies_in_scope,
         companies_evaluated=scoreboard.companies_evaluated,
         companies_with_benchmark=scoreboard.companies_with_benchmark,
+        harmonic_cohort_size=scoreboard.harmonic_cohort_size,
+        harmonic_cohort_evaluated=scoreboard.harmonic_cohort_evaluated,
         coverage_in_scope=scoreboard.coverage_in_scope,
         coverage_with_benchmark=scoreboard.coverage_with_benchmark,
         mape_headcount_current=scoreboard.headline_mape(),
-        mae_growth_1y_pct=scoreboard.headline_growth_mae(),
+        mae_growth_6m_pct=scoreboard.headline_growth_mae("6m"),
+        mae_growth_1y_pct=scoreboard.headline_growth_mae("1y"),
+        mae_growth_2y_pct=scoreboard.headline_growth_mae("2y"),
+        spearman_growth_6m=scoreboard.headline_spearman("6m"),
+        spearman_growth_1y=scoreboard.headline_spearman("1y"),
+        mape_headcount_current_zeeshan=_provider_mape("zeeshan"),
+        mape_headcount_current_linkedin=_provider_mape("linkedin"),
         review_queue_open=scoreboard.review_queue_open,
         high_confidence_disagreements=scoreboard.high_confidence_disagreements,
+        supporting_disagreements=scoreboard.supporting_disagreements,
         scoreboard_json=scoreboard.to_dict(),
         note=note,
     )
@@ -585,6 +762,8 @@ def persist_scoreboard(
         evaluation_id=row.id,
         as_of=scoreboard.as_of_month.isoformat(),
         headline_mape=scoreboard.headline_mape(),
+        spearman_growth_1y=scoreboard.headline_spearman("1y"),
+        harmonic_cohort=scoreboard.harmonic_cohort_size,
         companies_evaluated=scoreboard.companies_evaluated,
     )
     return row.id
@@ -592,6 +771,8 @@ def persist_scoreboard(
 
 __all__ = [
     "EVALUATION_VERSION",
+    "PRIMARY_PROVIDER",
+    "SUPPORTING_PROVIDERS",
     "Disagreement",
     "EvaluationConfig",
     "MetricBucket",

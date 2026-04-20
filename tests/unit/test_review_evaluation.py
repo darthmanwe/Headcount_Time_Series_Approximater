@@ -192,11 +192,7 @@ def _seed_benchmark(
         value_min=value_min,
         value_point=value_point,
         value_max=value_max,
-        value_kind=(
-            HeadcountValueKind.exact
-            if value_min is None
-            else HeadcountValueKind.range
-        ),
+        value_kind=(HeadcountValueKind.exact if value_min is None else HeadcountValueKind.range),
     )
     session.add(obs)
     session.flush()
@@ -215,28 +211,55 @@ def test_evaluate_matches_analyst_exactly_gives_zero_error(session: Session) -> 
     version = _seed_estimate_version(session, company)
     # Anchor months for zeeshan metrics when as_of=2026-04:
     # current=2026-04, 6m=2025-10, 1y=2025-04, 2y=2024-04
-    _seed_estimate_row(session, company=company, version_id=version.id,
-                       month=date(2026, 4, 1), value_point=350.0)
-    _seed_estimate_row(session, company=company, version_id=version.id,
-                       month=date(2025, 10, 1), value_point=341.0)
-    _seed_estimate_row(session, company=company, version_id=version.id,
-                       month=date(2025, 4, 1), value_point=333.0)
-    _seed_estimate_row(session, company=company, version_id=version.id,
-                       month=date(2024, 4, 1), value_point=318.0)
+    _seed_estimate_row(
+        session, company=company, version_id=version.id, month=date(2026, 4, 1), value_point=350.0
+    )
+    _seed_estimate_row(
+        session, company=company, version_id=version.id, month=date(2025, 10, 1), value_point=341.0
+    )
+    _seed_estimate_row(
+        session, company=company, version_id=version.id, month=date(2025, 4, 1), value_point=333.0
+    )
+    _seed_estimate_row(
+        session, company=company, version_id=version.id, month=date(2024, 4, 1), value_point=318.0
+    )
 
     # Zeeshan benchmarks aligned with those months.
-    _seed_benchmark(session, company=company, provider=BenchmarkProvider.zeeshan,
-                    metric=BenchmarkMetric.headcount_current,
-                    as_of=date(2026, 4, 1), value_point=350.0)
-    _seed_benchmark(session, company=company, provider=BenchmarkProvider.zeeshan,
-                    metric=BenchmarkMetric.headcount_6m_ago,
-                    as_of=date(2026, 4, 1), value_point=341.0, row_index=2)
-    _seed_benchmark(session, company=company, provider=BenchmarkProvider.zeeshan,
-                    metric=BenchmarkMetric.headcount_1y_ago,
-                    as_of=date(2026, 4, 1), value_point=333.0, row_index=3)
-    _seed_benchmark(session, company=company, provider=BenchmarkProvider.zeeshan,
-                    metric=BenchmarkMetric.headcount_2y_ago,
-                    as_of=date(2026, 4, 1), value_point=318.0, row_index=4)
+    _seed_benchmark(
+        session,
+        company=company,
+        provider=BenchmarkProvider.zeeshan,
+        metric=BenchmarkMetric.headcount_current,
+        as_of=date(2026, 4, 1),
+        value_point=350.0,
+    )
+    _seed_benchmark(
+        session,
+        company=company,
+        provider=BenchmarkProvider.zeeshan,
+        metric=BenchmarkMetric.headcount_6m_ago,
+        as_of=date(2026, 4, 1),
+        value_point=341.0,
+        row_index=2,
+    )
+    _seed_benchmark(
+        session,
+        company=company,
+        provider=BenchmarkProvider.zeeshan,
+        metric=BenchmarkMetric.headcount_1y_ago,
+        as_of=date(2026, 4, 1),
+        value_point=333.0,
+        row_index=3,
+    )
+    _seed_benchmark(
+        session,
+        company=company,
+        provider=BenchmarkProvider.zeeshan,
+        metric=BenchmarkMetric.headcount_2y_ago,
+        as_of=date(2026, 4, 1),
+        value_point=318.0,
+        row_index=4,
+    )
     session.flush()
 
     board = evaluate_against_benchmarks(session, as_of_month=date(2026, 4, 1))
@@ -263,24 +286,69 @@ def test_evaluate_matches_analyst_exactly_gives_zero_error(session: Session) -> 
 
 
 def test_evaluate_flags_high_confidence_disagreement(session: Session) -> None:
+    """Primary-provider (Harmonic) disagreements trip ``high_confidence_disagreements``."""
+
     company = _seed_company(session, "Acme")
     version = _seed_estimate_version(session, company)
-    # Estimate says 1000, benchmark says 100 -> abs_ratio 9.0, far
+    # Estimate says 1000, Harmonic says 100 -> abs_ratio 9.0, far
     # beyond the default 1.0 threshold and band is ``high``.
-    _seed_estimate_row(session, company=company, version_id=version.id,
-                       month=date(2026, 4, 1), value_point=1000.0,
-                       band=ConfidenceBand.high)
-    _seed_benchmark(session, company=company, provider=BenchmarkProvider.zeeshan,
-                    metric=BenchmarkMetric.headcount_current,
-                    as_of=date(2026, 4, 1), value_point=100.0)
+    _seed_estimate_row(
+        session,
+        company=company,
+        version_id=version.id,
+        month=date(2026, 4, 1),
+        value_point=1000.0,
+        band=ConfidenceBand.high,
+    )
+    _seed_benchmark(
+        session,
+        company=company,
+        provider=BenchmarkProvider.harmonic,
+        metric=BenchmarkMetric.headcount_current,
+        as_of=date(2026, 4, 1),
+        value_point=100.0,
+    )
     session.flush()
 
     board = evaluate_against_benchmarks(session, as_of_month=date(2026, 4, 1))
     assert board.high_confidence_disagreements == 1
+    assert board.supporting_disagreements == 0
     assert len(board.top_disagreements) == 1
     d = board.top_disagreements[0]
-    assert d.provider == "zeeshan"
+    assert d.provider == "harmonic"
     assert d.abs_ratio >= 1.0
+
+
+def test_evaluate_routes_supporting_provider_disagreements_separately(
+    session: Session,
+) -> None:
+    """A Zeeshan 9x-off row must not trip the Harmonic-only gate."""
+
+    company = _seed_company(session, "Acme")
+    version = _seed_estimate_version(session, company)
+    _seed_estimate_row(
+        session,
+        company=company,
+        version_id=version.id,
+        month=date(2026, 4, 1),
+        value_point=1000.0,
+        band=ConfidenceBand.high,
+    )
+    _seed_benchmark(
+        session,
+        company=company,
+        provider=BenchmarkProvider.zeeshan,
+        metric=BenchmarkMetric.headcount_current,
+        as_of=date(2026, 4, 1),
+        value_point=100.0,
+    )
+    session.flush()
+
+    board = evaluate_against_benchmarks(session, as_of_month=date(2026, 4, 1))
+    assert board.high_confidence_disagreements == 0
+    assert board.supporting_disagreements == 1
+    assert len(board.top_disagreements) == 1
+    assert board.top_disagreements[0].provider == "zeeshan"
 
 
 def test_evaluate_credits_interval_overlap(session: Session) -> None:
@@ -306,10 +374,16 @@ def test_evaluate_credits_interval_overlap(session: Session) -> None:
     session.add(row)
 
     # Benchmark interval 201-500 fully contains the estimate interval.
-    _seed_benchmark(session, company=company, provider=BenchmarkProvider.zeeshan,
-                    metric=BenchmarkMetric.headcount_current,
-                    as_of=date(2026, 4, 1), value_point=350.5,
-                    value_min=201.0, value_max=500.0)
+    _seed_benchmark(
+        session,
+        company=company,
+        provider=BenchmarkProvider.zeeshan,
+        metric=BenchmarkMetric.headcount_current,
+        as_of=date(2026, 4, 1),
+        value_point=350.5,
+        value_min=201.0,
+        value_max=500.0,
+    )
     session.flush()
 
     board = evaluate_against_benchmarks(session, as_of_month=date(2026, 4, 1))
@@ -338,11 +412,17 @@ def test_evaluate_counts_review_queue_open(session: Session) -> None:
 def test_persist_scoreboard_round_trips(session: Session) -> None:
     company = _seed_company(session, "Acme")
     version = _seed_estimate_version(session, company)
-    _seed_estimate_row(session, company=company, version_id=version.id,
-                       month=date(2026, 4, 1), value_point=100.0)
-    _seed_benchmark(session, company=company, provider=BenchmarkProvider.zeeshan,
-                    metric=BenchmarkMetric.headcount_current,
-                    as_of=date(2026, 4, 1), value_point=100.0)
+    _seed_estimate_row(
+        session, company=company, version_id=version.id, month=date(2026, 4, 1), value_point=100.0
+    )
+    _seed_benchmark(
+        session,
+        company=company,
+        provider=BenchmarkProvider.zeeshan,
+        metric=BenchmarkMetric.headcount_current,
+        as_of=date(2026, 4, 1),
+        value_point=100.0,
+    )
     session.flush()
 
     board = evaluate_against_benchmarks(session, as_of_month=date(2026, 4, 1))
@@ -364,16 +444,15 @@ def test_evaluate_scope_restriction(session: Session) -> None:
     b = _seed_company(session, "B")
     for c in (a, b):
         v = _seed_estimate_version(session, c)
-        _seed_estimate_row(session, company=c, version_id=v.id,
-                           month=date(2026, 4, 1), value_point=100.0)
+        _seed_estimate_row(
+            session, company=c, version_id=v.id, month=date(2026, 4, 1), value_point=100.0
+        )
     session.flush()
 
     board_all = evaluate_against_benchmarks(session, as_of_month=date(2026, 4, 1))
     assert board_all.companies_in_scope == 2
 
-    board_a = evaluate_against_benchmarks(
-        session, as_of_month=date(2026, 4, 1), company_ids=[a.id]
-    )
+    board_a = evaluate_against_benchmarks(session, as_of_month=date(2026, 4, 1), company_ids=[a.id])
     assert board_a.companies_in_scope == 1
     assert board_a.companies_evaluated == 1
 
@@ -381,18 +460,26 @@ def test_evaluate_scope_restriction(session: Session) -> None:
 def test_evaluation_config_threshold_controls_high_confidence_count(session: Session) -> None:
     company = _seed_company(session, "Acme")
     version = _seed_estimate_version(session, company)
-    _seed_estimate_row(session, company=company, version_id=version.id,
-                       month=date(2026, 4, 1), value_point=100.0,
-                       band=ConfidenceBand.medium)
-    _seed_benchmark(session, company=company, provider=BenchmarkProvider.zeeshan,
-                    metric=BenchmarkMetric.headcount_current,
-                    as_of=date(2026, 4, 1), value_point=150.0)
+    _seed_estimate_row(
+        session,
+        company=company,
+        version_id=version.id,
+        month=date(2026, 4, 1),
+        value_point=100.0,
+        band=ConfidenceBand.medium,
+    )
+    _seed_benchmark(
+        session,
+        company=company,
+        provider=BenchmarkProvider.harmonic,
+        metric=BenchmarkMetric.headcount_current,
+        as_of=date(2026, 4, 1),
+        value_point=150.0,
+    )
     session.flush()
 
     # Ratio = 50 / 150 = 0.333. Default threshold (1.0) should not flag.
-    board_default = evaluate_against_benchmarks(
-        session, as_of_month=date(2026, 4, 1)
-    )
+    board_default = evaluate_against_benchmarks(session, as_of_month=date(2026, 4, 1))
     assert board_default.high_confidence_disagreements == 0
 
     # Tighten threshold: 0.2 should flag.
@@ -402,3 +489,73 @@ def test_evaluation_config_threshold_controls_high_confidence_count(session: Ses
         config=EvaluationConfig(high_confidence_disagreement_ratio=0.2),
     )
     assert board_strict.high_confidence_disagreements == 1
+
+
+def test_harmonic_cohort_is_tracked_separately(session: Session) -> None:
+    """Only companies with a Harmonic benchmark row count as cohort."""
+
+    c_harmonic = _seed_company(session, "H-Corp")
+    c_zeeshan_only = _seed_company(session, "Z-Corp")
+    for c in (c_harmonic, c_zeeshan_only):
+        v = _seed_estimate_version(session, c)
+        _seed_estimate_row(
+            session, company=c, version_id=v.id, month=date(2026, 4, 1), value_point=100.0
+        )
+    _seed_benchmark(
+        session,
+        company=c_harmonic,
+        provider=BenchmarkProvider.harmonic,
+        metric=BenchmarkMetric.headcount_current,
+        as_of=date(2026, 4, 1),
+        value_point=100.0,
+    )
+    _seed_benchmark(
+        session,
+        company=c_zeeshan_only,
+        provider=BenchmarkProvider.zeeshan,
+        metric=BenchmarkMetric.headcount_current,
+        as_of=date(2026, 4, 1),
+        value_point=100.0,
+        row_index=2,
+    )
+    session.flush()
+
+    board = evaluate_against_benchmarks(session, as_of_month=date(2026, 4, 1))
+    assert board.companies_with_benchmark == 2
+    assert board.harmonic_cohort_size == 1
+    assert board.harmonic_cohort_evaluated == 1
+
+
+def test_rank_correlation_matches_harmonic_ordering(session: Session) -> None:
+    """Spearman rho == 1.0 when our growth ordering matches Harmonic's exactly."""
+
+    companies = []
+    for i, (now, ya) in enumerate([(100.0, 100.0), (200.0, 100.0), (300.0, 100.0), (400.0, 100.0)]):
+        c = _seed_company(session, f"Co{i}")
+        companies.append(c)
+        v = _seed_estimate_version(session, c)
+        # Growth ratio ~= (now - ya) / ya, increasing with i.
+        _seed_estimate_row(
+            session, company=c, version_id=v.id, month=date(2025, 4, 1), value_point=ya
+        )
+        _seed_estimate_row(
+            session, company=c, version_id=v.id, month=date(2026, 4, 1), value_point=now
+        )
+        # Harmonic 365d percentage that also increases with i.
+        pct = ((now - ya) / ya) * 100.0
+        _seed_benchmark(
+            session,
+            company=c,
+            provider=BenchmarkProvider.harmonic,
+            metric=BenchmarkMetric.growth_1y_pct,
+            as_of=date(2026, 4, 1),
+            value_point=pct,
+            row_index=i + 1,
+        )
+    session.flush()
+
+    board = evaluate_against_benchmarks(session, as_of_month=date(2026, 4, 1))
+    rho = board.rank_correlation.get("harmonic", {}).get("1y")
+    assert rho is not None
+    assert rho == pytest.approx(1.0, rel=1e-6)
+    assert board.headline_spearman("1y") == pytest.approx(1.0, rel=1e-6)

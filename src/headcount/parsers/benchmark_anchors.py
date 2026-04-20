@@ -74,34 +74,39 @@ _PROMOTABLE_METRICS: frozenset[BenchmarkMetric] = frozenset(
     }
 )
 
-_CURRENT_METRICS: frozenset[BenchmarkMetric] = frozenset(
-    {BenchmarkMetric.headcount_current}
-)
+_CURRENT_METRICS: frozenset[BenchmarkMetric] = frozenset({BenchmarkMetric.headcount_current})
 
 # Baseline confidence per provider.
 #
-# The benchmark workbook's providers have very different trust profiles:
+# The benchmark workbook's providers have very different trust profiles
+# *for our purposes*, where "our purpose" is: approximate Harmonic.ai's
+# numbers as closely as possible for the ~25 companies where Harmonic
+# is available, then rely on our own pipeline for the rest.
 #
-# * ``zeeshan`` is an analyst-verified column produced by human research
-#   (ranges and targeted point estimates). When the analyst has taken a
-#   position on a historical or current value, it should dominate.
-# * ``harmonic`` is an automated third-party data feed. Useful, but
-#   known to be wrong on specific slices (we observed cases where its
-#   ``headcount_current`` was an order of magnitude off the analyst's
-#   verified range - e.g. 65 vs. 350 for a real 201-500 company).
-# * ``linkedin`` numbers are scraped from the logged-out LinkedIn company
-#   page. The historical "Employee Count (N months ago)" cells are
-#   profile-appearance counts, not total headcount, and so should be the
-#   lowest-weight source for promotion.
+# * ``harmonic`` is the third-party feed we are explicitly trying to
+#   approximate. Its ``Headcount`` column is the target signal for
+#   ``headcount_current`` and its ``Headcount % (180d/365d)`` rates
+#   are the target signals for ``growth_6m_pct`` / ``growth_1y_pct``.
+#   When Harmonic has emitted a value, it dominates anchor promotion.
+# * ``zeeshan`` is produced by an automating service, not a human
+#   analyst. It is useful as a supporting signal: range buckets
+#   (``201-500``) corroborate Harmonic points, and the historical
+#   ``Employee Count (N months ago)`` cells plus the 2y growth
+#   percentage cover horizons Harmonic does not emit. It should not
+#   outrank Harmonic at the current month.
+# * ``linkedin`` numbers come from the logged-out LinkedIn company
+#   page - profile-appearance counts and the trend-graph deltas.
+#   Useful for shape/tie-breaking, weakest for absolute levels.
 #
 # Ordering matters: whenever two providers emit a value for the same
 # ``(company, month)``, the highest-confidence anchor wins in
 # :func:`headcount.estimate.reconcile.interpolate_series_from_anchors`
-# (via the per-month ``best_per_month`` dict). We therefore want the
-# analyst column to outrank automated feeds.
+# (via the per-month ``best_per_month`` dict). The floor values below
+# reflect "match Harmonic first, corroborate with Zeeshan second,
+# fall back to LinkedIn trend if neither emitted a value".
 _PROVIDER_CONFIDENCE: dict[BenchmarkProvider, float] = {
-    BenchmarkProvider.zeeshan: 0.65,
-    BenchmarkProvider.harmonic: 0.55,
+    BenchmarkProvider.harmonic: 0.70,
+    BenchmarkProvider.zeeshan: 0.55,
     BenchmarkProvider.linkedin: 0.45,
 }
 
@@ -179,9 +184,7 @@ def _confidence_for(provider: BenchmarkProvider) -> float:
     return _PROVIDER_CONFIDENCE.get(provider, 0.50)
 
 
-def _existing_source_id_for(
-    session: Session, *, content_hash: str
-) -> str | None:
+def _existing_source_id_for(session: Session, *, content_hash: str) -> str | None:
     row = session.execute(
         select(SourceObservation.id).where(
             SourceObservation.source_name == SourceName.benchmark,
@@ -296,10 +299,7 @@ def promote_benchmark_anchors(
             headcount_value_kind=kind,
             anchor_month=obs.as_of_month,
             confidence=confidence,
-            note=(
-                f"promoted_benchmark provider={obs.provider.value} "
-                f"metric={obs.metric.value}"
-            ),
+            note=(f"promoted_benchmark provider={obs.provider.value} metric={obs.metric.value}"),
         )
         session.add(anchor)
         result.inserted_anchor_rows += 1

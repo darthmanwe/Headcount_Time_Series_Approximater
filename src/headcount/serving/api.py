@@ -376,8 +376,7 @@ def create_app(session_factory: Any | None = None) -> FastAPI:
                 windows=[],
             )
         windows = [
-            GrowthWindowRow(**w)
-            for w in compute_growth_windows(session, version_id=version_id)
+            GrowthWindowRow(**w) for w in compute_growth_windows(session, version_id=version_id)
         ]
         return CompanyGrowthResponse(
             company=_company_summary(company),
@@ -435,16 +434,17 @@ def create_app(session_factory: Any | None = None) -> FastAPI:
         run = session.get(Run, run_id)
         if run is None:
             raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
-        rows = session.execute(
-            select(CompanyRunStatus).where(CompanyRunStatus.run_id == run_id)
-        ).scalars().all()
+        rows = (
+            session.execute(select(CompanyRunStatus).where(CompanyRunStatus.run_id == run_id))
+            .scalars()
+            .all()
+        )
         by_stage: dict[str, dict[str, int]] = {}
         for row in rows:
             stage_counts = by_stage.setdefault(row.stage.value, {})
             stage_counts[row.status.value] = stage_counts.get(row.status.value, 0) + 1
         stages = [
-            RunStageCounts(stage=stage, counts=counts)
-            for stage, counts in sorted(by_stage.items())
+            RunStageCounts(stage=stage, counts=counts) for stage, counts in sorted(by_stage.items())
         ]
         run_row = RunRow(
             id=run.id,
@@ -468,18 +468,14 @@ def create_app(session_factory: Any | None = None) -> FastAPI:
         stmt = (
             select(ReviewQueueItem, Company)
             .join(Company, Company.id == ReviewQueueItem.company_id)
-            .order_by(
-                ReviewQueueItem.priority.desc(), ReviewQueueItem.updated_at.desc()
-            )
+            .order_by(ReviewQueueItem.priority.desc(), ReviewQueueItem.updated_at.desc())
             .limit(limit)
         )
         if status is not None:
             try:
                 enum = ReviewStatus(status)
             except ValueError as exc:
-                raise HTTPException(
-                    status_code=400, detail=f"unknown status: {status}"
-                ) from exc
+                raise HTTPException(status_code=400, detail=f"unknown status: {status}") from exc
             stmt = stmt.where(ReviewQueueItem.status == enum)
         out: list[ReviewQueueRow] = []
         for item, company in session.execute(stmt).all():
@@ -506,15 +502,11 @@ def create_app(session_factory: Any | None = None) -> FastAPI:
 
         item = session.get(ReviewQueueItem, item_id)
         if item is None:
-            raise HTTPException(
-                status_code=404, detail=f"review item not found: {item_id}"
-            )
+            raise HTTPException(status_code=404, detail=f"review item not found: {item_id}")
         try:
             target = ReviewStatus(body.status)
         except ValueError as exc:
-            raise HTTPException(
-                status_code=400, detail=f"unknown status: {body.status}"
-            ) from exc
+            raise HTTPException(status_code=400, detail=f"unknown status: {body.status}") from exc
         previous = item.status
         item.status = target
         if target is ReviewStatus.assigned:
@@ -582,9 +574,7 @@ def create_app(session_factory: Any | None = None) -> FastAPI:
     ) -> OverrideRow:
         company = session.get(Company, body.company_id)
         if company is None:
-            raise HTTPException(
-                status_code=404, detail=f"company not found: {body.company_id}"
-            )
+            raise HTTPException(status_code=404, detail=f"company not found: {body.company_id}")
         override = ManualOverride(
             company_id=body.company_id,
             field_name=body.field_name,
@@ -667,9 +657,7 @@ def create_app(session_factory: Any | None = None) -> FastAPI:
 
         companies_total = session.scalar(select(Company.id).limit(1))
         _ = companies_total  # scalar(...) returns first id or None.
-        companies_count = len(
-            session.execute(select(Company.id)).scalars().all()
-        )
+        companies_count = len(session.execute(select(Company.id)).scalars().all())
         queue_counts: dict[str, int] = {}
         for item in session.execute(select(ReviewQueueItem.status)).scalars():
             queue_counts[item.value] = queue_counts.get(item.value, 0) + 1
@@ -678,9 +666,13 @@ def create_app(session_factory: Any | None = None) -> FastAPI:
         ).scalar_one_or_none()
         latest_run_out: dict[str, Any] | None = None
         if latest_run is not None:
-            stage_rows = session.execute(
-                select(CompanyRunStatus).where(CompanyRunStatus.run_id == latest_run.id)
-            ).scalars().all()
+            stage_rows = (
+                session.execute(
+                    select(CompanyRunStatus).where(CompanyRunStatus.run_id == latest_run.id)
+                )
+                .scalars()
+                .all()
+            )
             stage_counts: dict[str, int] = {}
             for sr in stage_rows:
                 key = sr.status.value
@@ -705,13 +697,49 @@ def create_app(session_factory: Any | None = None) -> FastAPI:
             "latest_run": latest_run_out,
         }
 
+    def _eval_summary(row: Any) -> dict[str, Any]:
+        """Promote the headline columns of an ``EvaluationRun`` row to
+        a dict suitable for ``/eval/latest`` / ``/eval/history``.
+
+        The full scoreboard JSON is *not* included; callers that need
+        the per-provider detail / disagreement table should hit
+        ``/eval/{id}``.
+        """
+
+        return {
+            "id": row.id,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "as_of_month": row.as_of_month.isoformat(),
+            "evaluation_version": row.evaluation_version,
+            "primary_provider": row.primary_provider,
+            "companies_in_scope": row.companies_in_scope,
+            "companies_evaluated": row.companies_evaluated,
+            "companies_with_benchmark": row.companies_with_benchmark,
+            "harmonic_cohort_size": row.harmonic_cohort_size,
+            "harmonic_cohort_evaluated": row.harmonic_cohort_evaluated,
+            "coverage_in_scope": row.coverage_in_scope,
+            "coverage_with_benchmark": row.coverage_with_benchmark,
+            "mape_headcount_current": row.mape_headcount_current,
+            "mae_growth_6m_pct": row.mae_growth_6m_pct,
+            "mae_growth_1y_pct": row.mae_growth_1y_pct,
+            "mae_growth_2y_pct": row.mae_growth_2y_pct,
+            "spearman_growth_6m": row.spearman_growth_6m,
+            "spearman_growth_1y": row.spearman_growth_1y,
+            "mape_headcount_current_zeeshan": row.mape_headcount_current_zeeshan,
+            "mape_headcount_current_linkedin": row.mape_headcount_current_linkedin,
+            "review_queue_open": row.review_queue_open,
+            "high_confidence_disagreements": row.high_confidence_disagreements,
+            "supporting_disagreements": row.supporting_disagreements,
+            "note": row.note,
+        }
+
     @app.get("/eval/latest", tags=["eval"])
     def eval_latest(session: Session = Depends(get_session)) -> dict[str, Any]:
         """Return the most recent ``evaluation_run`` scoreboard.
 
-        Phase 11 regression harness. Emits the full scoreboard JSON
-        plus the promoted headline metrics so dashboards can render
-        tiles without re-parsing.
+        Harmonic-primary regression harness. Emits the full scoreboard
+        JSON plus the promoted headline metrics so dashboards can
+        render tiles without re-parsing.
         """
 
         from headcount.models.evaluation_run import EvaluationRun
@@ -721,23 +749,9 @@ def create_app(session_factory: Any | None = None) -> FastAPI:
         ).scalar_one_or_none()
         if row is None:
             raise HTTPException(status_code=404, detail="no evaluation runs yet")
-        return {
-            "id": row.id,
-            "created_at": row.created_at.isoformat() if row.created_at else None,
-            "as_of_month": row.as_of_month.isoformat(),
-            "evaluation_version": row.evaluation_version,
-            "companies_in_scope": row.companies_in_scope,
-            "companies_evaluated": row.companies_evaluated,
-            "companies_with_benchmark": row.companies_with_benchmark,
-            "coverage_in_scope": row.coverage_in_scope,
-            "coverage_with_benchmark": row.coverage_with_benchmark,
-            "mape_headcount_current": row.mape_headcount_current,
-            "mae_growth_1y_pct": row.mae_growth_1y_pct,
-            "review_queue_open": row.review_queue_open,
-            "high_confidence_disagreements": row.high_confidence_disagreements,
-            "scoreboard": row.scoreboard_json,
-            "note": row.note,
-        }
+        payload = _eval_summary(row)
+        payload["scoreboard"] = row.scoreboard_json
+        return payload
 
     @app.get("/eval/history", tags=["eval"])
     def eval_history(
@@ -753,34 +767,12 @@ def create_app(session_factory: Any | None = None) -> FastAPI:
         from headcount.models.evaluation_run import EvaluationRun
 
         rows = session.execute(
-            select(EvaluationRun)
-            .order_by(EvaluationRun.created_at.desc())
-            .limit(limit)
+            select(EvaluationRun).order_by(EvaluationRun.created_at.desc()).limit(limit)
         ).scalars()
-        return [
-            {
-                "id": r.id,
-                "created_at": r.created_at.isoformat() if r.created_at else None,
-                "as_of_month": r.as_of_month.isoformat(),
-                "evaluation_version": r.evaluation_version,
-                "companies_in_scope": r.companies_in_scope,
-                "companies_evaluated": r.companies_evaluated,
-                "companies_with_benchmark": r.companies_with_benchmark,
-                "coverage_in_scope": r.coverage_in_scope,
-                "coverage_with_benchmark": r.coverage_with_benchmark,
-                "mape_headcount_current": r.mape_headcount_current,
-                "mae_growth_1y_pct": r.mae_growth_1y_pct,
-                "review_queue_open": r.review_queue_open,
-                "high_confidence_disagreements": r.high_confidence_disagreements,
-                "note": r.note,
-            }
-            for r in rows
-        ]
+        return [_eval_summary(r) for r in rows]
 
     @app.get("/eval/{evaluation_id}", tags=["eval"])
-    def eval_detail(
-        evaluation_id: str, session: Session = Depends(get_session)
-    ) -> dict[str, Any]:
+    def eval_detail(evaluation_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
         from headcount.models.evaluation_run import EvaluationRun
 
         row = session.get(EvaluationRun, evaluation_id)
@@ -788,23 +780,9 @@ def create_app(session_factory: Any | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=404, detail=f"evaluation_run not found: {evaluation_id}"
             )
-        return {
-            "id": row.id,
-            "created_at": row.created_at.isoformat() if row.created_at else None,
-            "as_of_month": row.as_of_month.isoformat(),
-            "evaluation_version": row.evaluation_version,
-            "companies_in_scope": row.companies_in_scope,
-            "companies_evaluated": row.companies_evaluated,
-            "companies_with_benchmark": row.companies_with_benchmark,
-            "coverage_in_scope": row.coverage_in_scope,
-            "coverage_with_benchmark": row.coverage_with_benchmark,
-            "mape_headcount_current": row.mape_headcount_current,
-            "mae_growth_1y_pct": row.mae_growth_1y_pct,
-            "review_queue_open": row.review_queue_open,
-            "high_confidence_disagreements": row.high_confidence_disagreements,
-            "scoreboard": row.scoreboard_json,
-            "note": row.note,
-        }
+        payload = _eval_summary(row)
+        payload["scoreboard"] = row.scoreboard_json
+        return payload
 
     log.info(
         "api_ready",

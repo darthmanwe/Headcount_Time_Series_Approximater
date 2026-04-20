@@ -1,38 +1,56 @@
+# Golden fixture (Harmonic-primary trust model).
+# accepted_anchor + latest monthly sample come from Harmonic
+# (the signal we are trying to approximate). Historical
+# samples and the 2y growth horizon fall back to Zeeshan
+# because Harmonic does not emit those.
 company:
-  canonical_name: "Allvue Systems"
+  canonical_name: Allvue Systems
   source_row:
-    workbook: "Sample Employee Growth for High Priority Prospects.xlsx"
-    sheet: "Zeeshan April 1"
+    workbook: Sample Employee Growth for High Priority Prospects.xlsx
+    sheet: Harmonic April 8
     row_index: 11
 accepted_anchor:
-  month: 2026-04-01
-  value_point: 750.5
-  value_min: 501.0
-  value_max: 1000.0
-  provider: zeeshan
+  month: '2026-04-01'
+  value_point: 575.0
+  provider: harmonic
   source:
-    workbook: "Sample Employee Growth for High Priority Prospects.xlsx"
-    sheet: "Zeeshan April 1"
+    workbook: Sample Employee Growth for High Priority Prospects.xlsx
+    sheet: Harmonic April 8
     row_index: 11
 monthly_samples:
-  - month: 2024-04-01
-    value_point: 815.0
-    tolerance_pct: 5.0
-    provider: zeeshan
-  - month: 2025-04-01
-    value_point: 781.0
-    tolerance_pct: 5.0
-    provider: zeeshan
-  - month: 2025-10-01
-    value_point: 765.0
-    tolerance_pct: 5.0
-    provider: zeeshan
-  - month: 2026-04-01
-    value_point: 750.5
-    tolerance_pct: 5.0
-    provider: zeeshan
+- month: '2024-04-01'
+  value_point: 815.0
+  tolerance_pct: 5.0
+  provider: zeeshan
+- month: '2025-04-01'
+  value_point: 781.0
+  tolerance_pct: 5.0
+  provider: zeeshan
+- month: '2025-10-01'
+  value_point: 765.0
+  tolerance_pct: 5.0
+  provider: zeeshan
+- month: '2026-04-01'
+  value_point: 575.0
+  tolerance_pct: 5.0
+  provider: harmonic
 growth_windows:
-  6m: {pct: -2.0, tolerance: 2.0, provider: zeeshan}
-  1y: {pct: -4.0, tolerance: 2.0, provider: zeeshan}
-  2y: {pct: -8.0, tolerance: 2.0, provider: zeeshan}
+  6m:
+    pct: -24.84
+    tolerance: 2.0
+    provider: harmonic
+    harmonic_target_pct: -1.54
+  1y:
+    pct: -26.38
+    tolerance: 2.0
+    provider: harmonic
+    harmonic_target_pct: 1.41
+  2y:
+    pct: -8.0
+    tolerance: 2.0
+    provider: zeeshan
 expected_confidence_band_latest: medium
+notes: 'Calibration target: Harmonic 1y +1.41% / 6m -1.54%. Pipeline output below
+  reflects the mixed evidence (Zeeshan historical anchors + Harmonic current); a calibration
+  gap between produced and target growth is expected and tracked by the evaluation
+  harness.'

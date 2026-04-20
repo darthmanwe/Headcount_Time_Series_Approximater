@@ -19,17 +19,24 @@ the golden passes.
 Hybrid expected-value source
 ----------------------------
 
-Per Phase 11 decision, expected values are **hybrid**:
+Expected values are **hybrid**, with precedence matching the product
+goal ("approximate Harmonic as closely as possible"):
 
-* analyst-verified (``zeeshan``) is the primary source; each field
-  records ``provider: zeeshan``
-* when the analyst column is silent, ``provider: harmonic`` is used
-* LinkedIn is never used as a golden source (profile-appearance
-  counts, not full headcount)
+* ``harmonic`` is the primary source for fields it emits:
+  ``accepted_anchor`` (current point), latest-month
+  ``monthly_samples[*]``, ``growth_windows.6m``, and
+  ``growth_windows.1y``. Each such field records ``provider:
+  harmonic``.
+* ``zeeshan`` is the fallback and the primary source for fields
+  Harmonic does not emit: historical ``monthly_samples[*]`` and
+  ``growth_windows.2y``. Those fields record ``provider: zeeshan``.
+* ``linkedin`` is never used as a golden source (profile-appearance
+  counts / trend-graph only, too noisy for per-field pins).
 
 The per-field ``provider`` key is informational and shows up in
-mismatch messages so analysts can see which reference they were
-measured against.
+mismatch messages so reviewers can see which reference they were
+measured against. Because Harmonic is the target signal, a mismatch
+against a ``harmonic``-provenance field is the most serious kind.
 """
 
 from __future__ import annotations
@@ -113,14 +120,24 @@ class GrowthExpectation:
     pct: float
     tolerance_pct_points: float
     provider: str
+    # Optional: when the pinned ``pct`` was derived from mixed
+    # provider evidence (e.g. Zeeshan historical anchor + Harmonic
+    # current), this records the Harmonic-reported value we are
+    # actually trying to approximate. The diff helper surfaces it
+    # in mismatch messages so reviewers can see the calibration gap
+    # at a glance. ``None`` when not applicable (e.g. 2y horizon
+    # which Harmonic does not emit).
+    harmonic_target_pct: float | None = None
 
     @classmethod
     def from_dict(cls, horizon: str, d: dict[str, Any]) -> GrowthExpectation:
+        target = d.get("harmonic_target_pct")
         return cls(
             horizon=horizon,
             pct=float(d["pct"]),
             tolerance_pct_points=float(d.get("tolerance", 2.0)),
             provider=str(d["provider"]),
+            harmonic_target_pct=(float(target) if target is not None else None),
         )
 
 
@@ -167,16 +184,13 @@ def load_golden_from_dict(payload: dict[str, Any]) -> GoldenFixture:
     samples = [MonthlySample.from_dict(s) for s in payload.get("monthly_samples", [])]
     growth_raw = payload.get("growth_windows", {}) or {}
     growth = tuple(
-        GrowthExpectation.from_dict(horizon, data)
-        for horizon, data in growth_raw.items()
+        GrowthExpectation.from_dict(horizon, data) for horizon, data in growth_raw.items()
     )
     band_raw = str(payload.get("expected_confidence_band_latest", "medium"))
     try:
         band = ConfidenceBand(band_raw)
     except ValueError as exc:
-        raise ValueError(
-            f"unknown confidence_band in golden: {band_raw!r}"
-        ) from exc
+        raise ValueError(f"unknown confidence_band in golden: {band_raw!r}") from exc
 
     return GoldenFixture(
         canonical_name=str(company["canonical_name"]),
@@ -304,9 +318,7 @@ def diff_confidence_band(
         return [
             GoldenMismatch(
                 kind="confidence_band_drift",
-                detail=(
-                    f"{fixture.canonical_name} @ latest month {latest_month}"
-                ),
+                detail=(f"{fixture.canonical_name} @ latest month {latest_month}"),
                 expected=fixture.expected_confidence_band_latest.value,
                 actual=actual_band.value,
             )
