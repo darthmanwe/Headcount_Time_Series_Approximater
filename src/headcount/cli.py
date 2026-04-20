@@ -235,6 +235,75 @@ def canonicalize(
     )
 
 
+@app.command("parse-events")
+def parse_events(
+    ctx: typer.Context,
+    only_pending: Annotated[
+        bool,
+        typer.Option(
+            "--pending/--all",
+            help=(
+                "Promote only candidates in status=pending_merge (default), or "
+                "re-scan everything - useful after bumping the hint->event map."
+            ),
+        ),
+    ] = True,
+    company_id: Annotated[
+        str | None,
+        typer.Option(
+            "--company-id",
+            help="Restrict merge to a single company; promote still runs globally.",
+        ),
+    ] = None,
+) -> None:
+    """Promote benchmark event candidates and merge duplicate events (Phase 6).
+
+    Two-pass deterministic flow:
+
+    1. Promote eligible ``benchmark_event_candidate`` rows to
+       ``company_event`` with ``source_class=benchmark``.
+    2. Collapse duplicate ``(company_id, event_type, event_month)`` events by
+       provenance precedence (``manual`` > ``first_party`` > ``press`` >
+       ``benchmark`` > ``manual_hint``).
+    """
+
+    from headcount.db.engine import session_scope
+    from headcount.parsers import merge_events, promote_benchmark_events
+
+    opts: GlobalOptions = ctx.obj
+    log = get_logger("headcount.cli.parse_events")
+
+    with session_scope() as session:
+        promote = promote_benchmark_events(session, only_pending=only_pending)
+        merge = merge_events(session, company_id=company_id)
+        if opts.dry_run:
+            session.rollback()
+
+    log.info(
+        "parse_events_done",
+        candidates_considered=promote.candidates_considered,
+        promoted=promote.promoted,
+        duplicates_of_existing=promote.duplicates_of_existing_event,
+        skipped_unresolved=promote.skipped_unresolved,
+        skipped_unknown_hint=promote.skipped_unknown_hint,
+        skipped_missing_month=promote.skipped_missing_month,
+        groups_considered=merge.groups_considered,
+        groups_collapsed=merge.groups_collapsed,
+        rows_deleted=merge.rows_deleted,
+        rows_updated=merge.rows_updated,
+        dry_run=opts.dry_run,
+    )
+    typer.echo(
+        f"promoted {promote.promoted} events "
+        f"(+{promote.duplicates_of_existing_event} dup of existing, "
+        f"{promote.skipped_unresolved} unresolved, "
+        f"{promote.skipped_unknown_hint} unknown hint, "
+        f"{promote.skipped_missing_month} missing month); "
+        f"merged {merge.groups_collapsed}/{merge.groups_considered} groups "
+        f"({merge.rows_deleted} duplicates removed)"
+    )
+
+
 @app.command("collect-anchors")
 def collect_anchors(
     ctx: typer.Context,

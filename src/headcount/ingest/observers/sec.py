@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime
 from typing import Any
 
 from headcount.db.enums import (
@@ -42,6 +41,7 @@ from headcount.ingest.base import (
     FetchContext,
     RawAnchorSignal,
 )
+from headcount.parsers.anchors import SEC_PARSER_VERSION, parse_sec_company_facts
 from headcount.resolution.normalize import normalize_name_key
 from headcount.utils.logging import get_logger
 from headcount.utils.time import month_floor
@@ -50,16 +50,6 @@ _log = get_logger("headcount.ingest.observers.sec")
 
 TICKER_URL = "https://www.sec.gov/files/company_tickers.json"
 FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-
-_EMPLOYEE_CONCEPTS: tuple[str, ...] = (
-    "EntityCommonStockSharesOutstanding",
-    "us-gaap:EmployeeNumberOfEmployees",
-    "us-gaap:NumberOfEmployees",
-    "dei:EntityNumberOfEmployees",
-    "EntityNumberOfEmployees",
-    "NumberOfEmployees",
-    "EmployeeEquivalentsFullTimeAndPartTimeTotalNumberOfEmployees",
-)
 
 _CIK_PAD = 10
 
@@ -72,7 +62,7 @@ class SECObserver(AnchorSourceAdapter):
     """EDGAR company-facts observer."""
 
     source_name = SourceName.sec
-    parser_version = "sec-v1"
+    parser_version = SEC_PARSER_VERSION
 
     def __init__(self, *, user_agent: str | None = None, max_results: int = 3) -> None:
         super().__init__()
@@ -149,38 +139,34 @@ class SECObserver(AnchorSourceAdapter):
         except json.JSONDecodeError as exc:
             raise AdapterFetchError(f"SEC facts not JSON: {exc!r}") from exc
         entity_name = str(facts.get("entityName", entry["title"]))
-        employee_values = _extract_employee_values(facts)
-        if not employee_values:
+        employee_rows = parse_sec_company_facts(facts)
+        if not employee_rows:
             return []
         signals: list[RawAnchorSignal] = []
-        for row in sorted(
-            employee_values,
-            key=lambda r: (r["end"], r.get("filed", "")),
-            reverse=True,
-        )[: self._max_results]:
+        for row in employee_rows[: self._max_results]:
             signals.append(
                 RawAnchorSignal(
                     source_name=self.source_name,
                     entity_type=SourceEntityType.company,
                     source_url=f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}",
-                    anchor_month=month_floor(row["end"]),
+                    anchor_month=month_floor(row.end),
                     anchor_type=AnchorType.historical_statement,
-                    headcount_value_min=float(row["val"]),
-                    headcount_value_point=float(row["val"]),
-                    headcount_value_max=float(row["val"]),
+                    headcount_value_min=row.value,
+                    headcount_value_point=row.value,
+                    headcount_value_max=row.value,
                     headcount_value_kind=HeadcountValueKind.exact,
                     confidence=0.85,
-                    raw_text=f"{entity_name} {row['concept']} FY{row['fy']} {row['fp']}={int(row['val'])}",
+                    raw_text=f"{entity_name} {row.concept} FY{row.fy} {row.fp}={int(row.value)}",
                     parser_version=self.parser_version,
                     parse_status=ParseStatus.ok,
                     note=f"cik={cik} ticker={entry['ticker']}",
                     normalized_payload={
                         "cik": cik,
-                        "concept": row["concept"],
-                        "fy": row.get("fy"),
-                        "fp": row.get("fp"),
-                        "end": row["end"].isoformat(),
-                        "filed": row.get("filed"),
+                        "concept": row.concept,
+                        "fy": row.fy,
+                        "fp": row.fp,
+                        "end": row.end.isoformat(),
+                        "filed": row.filed,
                         "ticker": entry["ticker"],
                     },
                 )
@@ -192,32 +178,3 @@ class SECObserver(AnchorSourceAdapter):
             matched=len(signals),
         )
         return signals
-
-
-def _extract_employee_values(facts: dict[str, Any]) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    facts_bucket = facts.get("facts", {})
-    for taxonomy, concepts in facts_bucket.items():
-        for concept, details in concepts.items():
-            qualified = f"{taxonomy}:{concept}"
-            if concept not in {c.split(":")[-1] for c in _EMPLOYEE_CONCEPTS}:
-                continue
-            for unit_rows in details.get("units", {}).values():
-                for entry in unit_rows:
-                    try:
-                        end = datetime.fromisoformat(entry["end"]).date()
-                    except (KeyError, ValueError):
-                        continue
-                    if "val" not in entry:
-                        continue
-                    rows.append(
-                        {
-                            "concept": qualified,
-                            "end": end,
-                            "val": entry["val"],
-                            "fy": entry.get("fy"),
-                            "fp": entry.get("fp"),
-                            "filed": entry.get("filed"),
-                        }
-                    )
-    return rows

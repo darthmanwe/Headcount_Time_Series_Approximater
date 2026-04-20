@@ -21,8 +21,6 @@ citation URL to analysts.
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
-from typing import Any
 
 from headcount.db.enums import (
     AnchorType,
@@ -38,8 +36,8 @@ from headcount.ingest.base import (
     FetchContext,
     RawAnchorSignal,
 )
+from headcount.parsers.anchors import WIKIDATA_PARSER_VERSION, parse_wikidata_row
 from headcount.utils.logging import get_logger
-from headcount.utils.time import month_floor
 
 _log = get_logger("headcount.ingest.observers.wikidata")
 
@@ -75,7 +73,7 @@ class WikidataObserver(AnchorSourceAdapter):
     """Query Wikidata for ``P1128`` number-of-employees statements."""
 
     source_name = SourceName.wikidata
-    parser_version = "wikidata-v1"
+    parser_version = WIKIDATA_PARSER_VERSION
 
     def __init__(
         self,
@@ -121,14 +119,41 @@ class WikidataObserver(AnchorSourceAdapter):
             except json.JSONDecodeError as exc:
                 raise AdapterFetchError(f"wikidata returned non-JSON: {exc!r}") from exc
             for row in payload.get("results", {}).get("bindings", []):
-                signal = _row_to_signal(row, reason=reason, parser_version=self.parser_version)
-                if signal is None:
+                anchor = parse_wikidata_row(row, reason=reason)
+                if anchor is None:
                     continue
-                qid = row.get("company", {}).get("value", "")
-                if qid in seen_company_qids:
+                if anchor.qid in seen_company_qids:
                     continue
-                seen_company_qids.add(qid)
-                results.append(signal)
+                seen_company_qids.add(anchor.qid)
+                results.append(
+                    RawAnchorSignal(
+                        source_name=self.source_name,
+                        entity_type=SourceEntityType.company,
+                        source_url=anchor.qid or None,
+                        anchor_month=anchor.anchor_month,
+                        anchor_type=(
+                            AnchorType.historical_statement
+                            if anchor.is_historical
+                            else AnchorType.current_headcount_anchor
+                        ),
+                        headcount_value_min=anchor.employees,
+                        headcount_value_point=anchor.employees,
+                        headcount_value_max=anchor.employees,
+                        headcount_value_kind=HeadcountValueKind.exact,
+                        confidence=0.7 if reason == "domain" else 0.55,
+                        raw_text=f"{anchor.label} P1128={int(anchor.employees)} asof={anchor.asof or 'n/a'}",
+                        parser_version=self.parser_version,
+                        parse_status=ParseStatus.ok,
+                        note=f"wikidata match by {reason}",
+                        normalized_payload={
+                            "qid": anchor.qid,
+                            "label": anchor.label,
+                            "employees": anchor.employees,
+                            "asof": anchor.asof,
+                            "match_reason": reason,
+                        },
+                    )
+                )
                 if len(results) >= self._max_results:
                     break
         _log.info(
@@ -141,57 +166,3 @@ class WikidataObserver(AnchorSourceAdapter):
 
 def _escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"').lower()
-
-
-def _row_to_signal(
-    row: dict[str, Any],
-    *,
-    reason: str,
-    parser_version: str,
-) -> RawAnchorSignal | None:
-    try:
-        employees_raw = row["employees"]["value"]
-        employees = float(employees_raw)
-    except (KeyError, ValueError, TypeError):
-        return None
-    if employees <= 0:
-        return None
-    qid = row.get("company", {}).get("value", "")
-    label = row.get("companyLabel", {}).get("value", "")
-    asof_raw = row.get("asof", {}).get("value")
-    anchor_month = _parse_asof(asof_raw)
-    return RawAnchorSignal(
-        source_name=SourceName.wikidata,
-        entity_type=SourceEntityType.company,
-        source_url=qid or None,
-        anchor_month=anchor_month,
-        anchor_type=AnchorType.historical_statement
-        if asof_raw
-        else AnchorType.current_headcount_anchor,
-        headcount_value_min=employees,
-        headcount_value_point=employees,
-        headcount_value_max=employees,
-        headcount_value_kind=HeadcountValueKind.exact,
-        confidence=0.7 if reason == "domain" else 0.55,
-        raw_text=f"{label} P1128={int(employees)} asof={asof_raw or 'n/a'}",
-        parser_version=parser_version,
-        parse_status=ParseStatus.ok,
-        note=f"wikidata match by {reason}",
-        normalized_payload={
-            "qid": qid,
-            "label": label,
-            "employees": employees,
-            "asof": asof_raw,
-            "match_reason": reason,
-        },
-    )
-
-
-def _parse_asof(value: str | None) -> date:
-    if not value:
-        return month_floor(date.today())
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return month_floor(parsed.date())
-    except ValueError:
-        return month_floor(date.today())

@@ -5,11 +5,15 @@ from __future__ import annotations
 import pytest
 
 from headcount.ingest.base import CompanyTarget
-from headcount.ingest.observers.linkedin_public import (
-    _extract_badge,
-    _extract_exact_count,
-    _looks_gated,
-    _resolve_slug,
+from headcount.ingest.observers.linkedin_public import _resolve_slug
+from headcount.parsers.anchors import (
+    extract_linkedin_badge as _extract_badge,
+)
+from headcount.parsers.anchors import (
+    extract_linkedin_exact_count as _extract_exact_count,
+)
+from headcount.parsers.anchors import (
+    looks_gated_linkedin as _looks_gated,
 )
 
 
