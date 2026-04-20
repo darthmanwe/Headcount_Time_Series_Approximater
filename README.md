@@ -12,5 +12,7 @@ Included:
 - Cursor rules
 - Codex and Cursor prompts
 - PLANS.md ExecPlan template
+- offline benchmark spreadsheets in `test_source/`
 
 This version explicitly includes a bounded logged-out public LinkedIn observation path as one source mode in the architecture.
+It also includes offline benchmark inputs for comparing system outputs against Harmonic.ai-style spreadsheet results and company-detail ground-truth examples.

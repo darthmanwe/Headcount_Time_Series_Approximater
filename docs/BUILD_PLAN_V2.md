@@ -261,6 +261,9 @@ headcount-system/
     METHODOLOGY_AND_ASSUMPTIONS_V2.md
     SOURCE_MATRIX_V2.md
     ACCEPTANCE_CRITERIA_V2.md
+  test_source/
+    High Priority Companies_01.04.2026.xlsx
+    Sample Employee Growth for High Priority Prospects.xlsx
   apps/
     api/
     review_ui/
@@ -417,6 +420,24 @@ Use only if job graph grows.
 
 ### Option C: Airflow
 Not recommended for the narrow slice.
+
+---
+
+## 6.7 Offline benchmark inputs
+
+The build pack includes offline spreadsheet inputs in `test_source/`:
+
+- `High Priority Companies_01.04.2026.xlsx`
+- `Sample Employee Growth for High Priority Prospects.xlsx`
+
+These files are used to:
+
+- benchmark approximation quality against Harmonic.ai-style outputs captured in the spreadsheets
+- provide company-detail examples that act as ground-truth references for narrow-slice validation
+- seed golden tests, comparison exports, and analyst-review scenarios
+
+They are not live acquisition sources.
+They are offline validation artifacts and must preserve workbook, sheet, row, and column provenance in any derived fixture or expected-output record.
 
 ---
 
@@ -860,6 +881,8 @@ The first slice is acceptable if it can:
 7. route weak estimates to review
 8. support manual overrides and reruns
 9. export a comparison table against benchmark data
+10. import or derive benchmark fixtures from the offline spreadsheets in `test_source/`
+11. retain row-level provenance for benchmark comparisons and ground-truth examples
 
 ---
 
@@ -868,6 +891,7 @@ The first slice is acceptable if it can:
 ## 12.1 Stage 0: seed companies
 Input:
 - spreadsheet or CSV of target companies
+- offline benchmark spreadsheets in `test_source/` when preparing comparison fixtures or ground-truth examples
 
 Output:
 - seeded `company_candidate` rows
@@ -918,6 +942,7 @@ Output:
 - CSV
 - parquet
 - API payloads
+- benchmark comparison outputs against `test_source/`
 
 ---
 
@@ -997,18 +1022,30 @@ Test:
 ## 15.3 Golden tests
 Create a benchmark set of companies with hand-validated outputs.
 
+Seed this benchmark set from the offline spreadsheet inputs in `test_source/` where possible.
+
 For each:
 - canonical company record
 - accepted anchor
 - validated monthly series sample
 - expected 6m/1y/2y outputs
 - expected confidence band
+- source workbook/sheet/row references when expectations come from `test_source/`
 
 Golden tests must fail when parser or estimator regress.
 
 ## 15.4 Snapshot fixtures
 Persist representative raw public pages as fixtures.
 Never make tests depend on live web responses.
+
+## 15.5 Benchmark comparison tests
+
+Add an offline benchmark comparison layer that:
+
+- reads or normalizes the spreadsheet examples in `test_source/`
+- compares produced monthly series and growth outputs against Harmonic.ai-style reference values where available
+- uses company-detail examples as ground-truth checks for canonicalization, anchor selection, and review outcomes
+- reports mismatches with preserved workbook/sheet/row provenance
 
 ---
 
@@ -1120,6 +1157,7 @@ Mitigation:
 - shared schemas
 - logging
 - CLI shell
+- benchmark-import contracts for `test_source/`
 
 ## 19.2 Company resolution
 - company seed import
@@ -1159,6 +1197,7 @@ Mitigation:
 - growth table
 - evidence export
 - comparison export
+- benchmark comparison export keyed back to `test_source/`
 
 ---
 

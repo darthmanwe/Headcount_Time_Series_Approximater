@@ -9,6 +9,8 @@ Read these first:
 - docs/SOURCE_MATRIX_V2.md
 - docs/ACCEPTANCE_CRITERIA_V2.md
 - plans/PLANS.md
+- `test_source/High Priority Companies_01.04.2026.xlsx`
+- `test_source/Sample Employee Growth for High Priority Prospects.xlsx`
 
 Produce a reviewable implementation plan that includes:
 - repo/module structure
@@ -22,6 +24,7 @@ Produce a reviewable implementation plan that includes:
 - API and CLI design
 - testing strategy
 - file-by-file implementation order
+- benchmark strategy for comparing outputs against the offline Harmonic.ai-style spreadsheets and for using company-detail examples as ground-truth references
 
 Hard constraints:
 - public pages only for LinkedIn path
@@ -37,3 +40,4 @@ Prefer:
 - low operational complexity
 - explicit contracts
 - small modules
+- provenance-preserving benchmark imports from `test_source/`

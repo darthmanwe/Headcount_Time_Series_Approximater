@@ -13,6 +13,7 @@
 | Logged-out public LinkedIn company pages | Current anchor | Closest metric surface to target | Can be gated, volatile | High |
 | Logged-out public LinkedIn public profiles | Employment intervals | Best public interval signal | Coverage bias, parsing noise | High |
 | Job boards / ATS pages | Hiring activity | Useful directional support | Not headcount truth | Medium |
+| Offline benchmark spreadsheets in `test_source/` | Validation, golden tests, comparison export | Deterministic, reviewable, packaged with repo | Not a live evidence source | High |
 
 ## 2. Recommended weighting by role
 

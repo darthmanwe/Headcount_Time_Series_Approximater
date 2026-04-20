@@ -1,8 +1,0 @@
-model = "gpt-5"
-approval_policy = "on-request"
-
-[tools]
-internet_access = false
-
-[project]
-name = "headcount-system"

@@ -126,6 +126,26 @@ Every parser must have fixture tests.
 Every estimator change must have golden tests or snapshot tests.
 Never merge a parser change without at least one representative fixture.
 
+## Benchmark and ground-truth inputs
+
+The `test_source/` folder is part of the build pack and must be treated as a required offline evaluation input.
+
+Current benchmark inputs:
+- `test_source/High Priority Companies_01.04.2026.xlsx`
+- `test_source/Sample Employee Growth for High Priority Prospects.xlsx`
+
+Use these files to:
+- test approximation accuracy against Harmonic.ai-style output in the spreadsheets
+- build benchmark fixtures for end-to-end estimation evaluation
+- extract company detail examples that act as ground-truth references for resolution, anchors, growth windows, and review behavior
+
+Rules:
+- do not treat these spreadsheets as live source adapters; they are offline benchmark and validation inputs
+- preserve workbook, sheet, row, and column provenance for any derived fixtures or expected outputs
+- keep benchmark imports deterministic and rerunnable
+- if a benchmark row conflicts with weak public evidence, route to review rather than silently forcing the estimate
+- any plan that changes estimation, confidence, resolution, or exports must state how the `test_source/` benchmarks are affected
+
 ## Definition of done
 
 A feature is done when:
@@ -135,3 +155,4 @@ A feature is done when:
 - confidence logic is covered
 - review behavior is defined
 - docs are updated
+- relevant benchmark coverage from `test_source/` is updated or explicitly marked unchanged

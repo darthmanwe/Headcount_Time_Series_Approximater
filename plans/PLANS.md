@@ -26,11 +26,14 @@ List tables, fields, migrations, indexes.
 ### Source and parsing changes
 List adapters, parsers, and fixture updates.
 
+### Benchmark and validation inputs
+List which `test_source/` files are used, how workbook/sheet/row provenance is preserved, and what benchmark fixtures or expected outputs are added or updated.
+
 ### Estimation changes
 List estimator or confidence logic changes.
 
 ### Test plan
-Unit, integration, golden tests.
+Unit, integration, golden tests, and benchmark comparisons against the offline `test_source/` spreadsheets.
 
 ### Risks
 Top risks and how to mitigate them.

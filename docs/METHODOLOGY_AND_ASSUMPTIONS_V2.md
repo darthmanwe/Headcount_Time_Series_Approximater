@@ -143,3 +143,13 @@ Interpret outputs as:
 - strongest at recent windows
 - weakest when entity resolution is poor or event contamination is high
 - good enough for prioritization, internal pipeline analysis, and directional prospect assessment when paired with confidence and review workflows
+
+## 13. Benchmarking assumptions
+
+The offline spreadsheets in `test_source/` are used as validation references for this build pack.
+
+Assumptions:
+- Harmonic.ai-style values captured in those spreadsheets are benchmark targets for approximation quality, not unquestionable truth
+- company-detail examples in those spreadsheets can serve as ground-truth references for narrow, explicit behaviors such as canonical mapping, anchor choice, expected review state, and growth-window validation
+- benchmark-derived expectations must preserve workbook, sheet, row, and column provenance
+- disagreements between benchmark references and weak public evidence should trigger review, not silent coercion of the estimator

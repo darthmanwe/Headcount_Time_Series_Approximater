@@ -19,6 +19,9 @@ The narrow slice is complete when all of the following are true:
 13. Golden tests validate estimation on a benchmark fixture set.
 14. Export endpoints or CLI exports exist for final output tables.
 15. Every final estimate can show its evidence trace.
+16. The offline spreadsheets in `test_source/` are wired into benchmark or validation flows with preserved provenance.
+17. System outputs can be compared against the Harmonic.ai-style results captured in `test_source/`.
+18. Company-detail examples from `test_source/` are available as ground-truth references for reviewable test cases where applicable.
 
 ## Failure criteria
 

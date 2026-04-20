@@ -1,6 +1,9 @@
 You are acting as a principal engineer and system architect.
 
 Read AGENTS.md, docs/BUILD_PLAN_V2.md, docs/METHODOLOGY_AND_ASSUMPTIONS_V2.md, docs/SOURCE_MATRIX_V2.md, docs/ACCEPTANCE_CRITERIA_V2.md, and plans/PLANS.md first.
+Also inspect the offline benchmark files in `test_source/` and incorporate them into the plan:
+- `test_source/High Priority Companies_01.04.2026.xlsx`
+- `test_source/Sample Employee Growth for High Priority Prospects.xlsx`
 
 Task:
 Create a full implementation plan for the narrow-slice internal headcount estimation system.
@@ -53,6 +56,7 @@ Deliverables for the plan:
 - benchmark and golden-test strategy
 - implementation order
 - major risks and mitigations
+- explicit handling of the offline benchmark spreadsheets used to compare system output against Harmonic.ai-style results and company-detail ground truths
 
 Rules:
 - do not hand-wave
@@ -61,3 +65,4 @@ Rules:
 - call out assumptions and unresolved questions clearly
 - include acceptance criteria for each phase
 - output the plan as a concrete ExecPlan in PLANS.md style
+- preserve workbook/sheet/row provenance for any benchmark-derived fixtures or expected outputs
