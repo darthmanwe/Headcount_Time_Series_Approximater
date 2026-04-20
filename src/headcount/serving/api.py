@@ -715,6 +715,7 @@ def create_app(session_factory: Any | None = None) -> FastAPI:
             "companies_in_scope": row.companies_in_scope,
             "companies_evaluated": row.companies_evaluated,
             "companies_with_benchmark": row.companies_with_benchmark,
+            "companies_declined_to_estimate": row.companies_declined_to_estimate,
             "harmonic_cohort_size": row.harmonic_cohort_size,
             "harmonic_cohort_evaluated": row.harmonic_cohort_evaluated,
             "coverage_in_scope": row.coverage_in_scope,

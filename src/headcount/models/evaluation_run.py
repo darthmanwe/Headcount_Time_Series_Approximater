@@ -55,6 +55,13 @@ class EvaluationRun(UUIDPk, Timestamped, Base):
     companies_in_scope: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     companies_evaluated: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     companies_with_benchmark: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Companies whose latest version is entirely declined rows
+    # (no real anchor). Reported separately from coverage so a thin
+    # free-data day does not silently poison MAPE. See BUG-B in
+    # docs/HARMONIC_COHORT_LIVE_RUN.md.
+    companies_declined_to_estimate: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
 
     # Harmonic cohort: the (small) calibration set of companies that
     # have at least one Harmonic benchmark row. Tracked separately so

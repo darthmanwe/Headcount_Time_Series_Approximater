@@ -146,13 +146,28 @@ if latest is not None:
         "Companies with any benchmark",
         latest.get("companies_with_benchmark", 0),
     )
+    declined = (
+        board.get("companies", {}).get("declined_to_estimate")
+        if isinstance(board.get("companies"), dict)
+        else None
+    )
+    if declined is None:
+        declined = latest.get("companies_declined_to_estimate", 0)
     pop_cols[3].metric(
-        "Supporting disagreements (Z+LI)",
-        board.get("review", {}).get("supporting_disagreements", 0),
+        "Declined to estimate",
+        declined,
         help=(
-            "High/medium-band rows off Zeeshan or LinkedIn by > 2x. "
-            "Diagnostic only; never blocks the gate."
+            "Companies whose latest version is entirely placeholder rows "
+            "(no real anchor). Excluded from MAPE so thin free-data days "
+            "do not drag the headline KPI; surfaced here as a coverage "
+            "gap instead."
         ),
+    )
+
+    supporting = board.get("review", {}).get("supporting_disagreements", 0)
+    st.caption(
+        f"Supporting (Zeeshan + LinkedIn) disagreements flagged: {supporting}. "
+        "Diagnostic only; never blocks the gate."
     )
 
     bands = board.get("confidence_bands", {}) or {}

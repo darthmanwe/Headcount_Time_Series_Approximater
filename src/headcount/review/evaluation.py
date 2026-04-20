@@ -70,6 +70,7 @@ from sqlalchemy.orm import Session
 from headcount.db.enums import (
     BenchmarkMetric,
     ConfidenceBand,
+    EstimateMethod,
     ReviewStatus,
 )
 from headcount.estimate.growth import latest_growth_windows
@@ -116,6 +117,32 @@ _HEADCOUNT_METRIC_OFFSETS: dict[BenchmarkMetric, int] = {
     BenchmarkMetric.headcount_2y_ago: -24,
 }
 
+# EstimateMethod values that mean "we looked and declined to produce a
+# real number." The stored ``estimated_headcount`` on these rows is a
+# placeholder (0.0 for no-anchor-at-all segments, or the anchor point
+# copied forward for anchor_month_has_no_profiles) and should never be
+# compared against a benchmark as if it were a genuine estimate.
+_DECLINED_METHODS: frozenset[EstimateMethod] = frozenset(
+    {
+        EstimateMethod.suppressed_low_sample,
+        EstimateMethod.degraded_current_only,
+    }
+)
+
+
+def _estimate_declined(est: MonthlyEstimate) -> bool:
+    """True when the pipeline effectively declined to estimate this month.
+
+    Covers the ``no_anchor_in_segment`` case (zero real signal) and
+    ``anchor_month_has_no_profiles`` (anchor exists but coverage is so
+    low we fall back to the anchor point). In both cases the numeric
+    value in ``estimated_headcount`` is a placeholder, not an estimate.
+    """
+
+    if est.method in _DECLINED_METHODS:
+        return True
+    return est.confidence_band is ConfidenceBand.manual_review_required
+
 
 # ---------------------------------------------------------------------------
 # Config & result types
@@ -144,11 +171,21 @@ class EvaluationConfig:
 
 @dataclass(slots=True)
 class MetricBucket:
-    """Per-(provider, metric) accuracy bucket."""
+    """Per-(provider, metric) accuracy bucket.
+
+    ``skipped_declined`` counts benchmark rows that we intentionally did
+    *not* score because the estimator declined to produce a value
+    (method = ``suppressed_low_sample`` / ``degraded_current_only`` with
+    no real anchor). Rolling those 0.0 placeholders into MAPE would
+    dominate the metric whenever live data is thin and hide real
+    accuracy on companies we actually have signal for, so we report the
+    coverage gap separately (see BUG-B in docs/HARMONIC_COHORT_LIVE_RUN.md).
+    """
 
     n: int = 0
     errors_abs: list[float] = field(default_factory=list)
     errors_pct: list[float] = field(default_factory=list)
+    skipped_declined: int = 0
 
     def add_point(
         self,
@@ -163,12 +200,19 @@ class MetricBucket:
 
     def summary(self) -> dict[str, float | int | None]:
         if self.n == 0:
-            return {"n": 0, "mae": None, "mape": None, "median_abs_error": None}
+            return {
+                "n": 0,
+                "mae": None,
+                "mape": None,
+                "median_abs_error": None,
+                "skipped_declined": self.skipped_declined,
+            }
         return {
             "n": self.n,
             "mae": round(statistics.fmean(self.errors_abs), 4),
             "mape": (round(statistics.fmean(self.errors_pct), 4) if self.errors_pct else None),
             "median_abs_error": round(statistics.median(self.errors_abs), 4),
+            "skipped_declined": self.skipped_declined,
         }
 
 
@@ -215,6 +259,11 @@ class Scoreboard:
     companies_in_scope: int
     companies_evaluated: int
     companies_with_benchmark: int
+    # Companies whose latest estimate version is entirely made up of
+    # "declined" rows (no real anchor). These are counted as evaluated
+    # for coverage purposes but excluded from accuracy so the 0.0
+    # placeholders do not poison MAPE.
+    companies_declined_to_estimate: int
     coverage_in_scope: float
     coverage_with_benchmark: float
     # Harmonic cohort = the small set of companies where we actually
@@ -247,6 +296,7 @@ class Scoreboard:
                 "in_scope": self.companies_in_scope,
                 "evaluated": self.companies_evaluated,
                 "with_benchmark": self.companies_with_benchmark,
+                "declined_to_estimate": self.companies_declined_to_estimate,
             },
             "coverage": {
                 "in_scope": round(self.coverage_in_scope, 4),
@@ -504,14 +554,20 @@ def evaluate_against_benchmarks(
     confidence_bands: dict[str, int] = {band.value: 0 for band in ConfidenceBand}
 
     companies_evaluated = 0
+    companies_declined = 0
     for cid in scope_set:
         monthly = estimates_by_company.get(cid)
-        if monthly:
-            companies_evaluated += 1
-            for est in monthly.values():
-                confidence_bands[est.confidence_band.value] = (
-                    confidence_bands.get(est.confidence_band.value, 0) + 1
-                )
+        if not monthly:
+            continue
+        companies_evaluated += 1
+        for est in monthly.values():
+            confidence_bands[est.confidence_band.value] = (
+                confidence_bands.get(est.confidence_band.value, 0) + 1
+            )
+        # A company "declined" when every month in its latest version
+        # is a placeholder produced without a real anchor.
+        if all(_estimate_declined(est) for est in monthly.values()):
+            companies_declined += 1
 
     companies_with_benchmark = sum(1 for cid in scope_set if benchmarks_by_company.get(cid))
 
@@ -605,6 +661,7 @@ def evaluate_against_benchmarks(
         companies_in_scope=len(scope_set),
         companies_evaluated=companies_evaluated,
         companies_with_benchmark=companies_with_benchmark,
+        companies_declined_to_estimate=companies_declined,
         coverage_in_scope=round(coverage_in_scope, 4),
         coverage_with_benchmark=round(coverage_with_benchmark, 4),
         harmonic_cohort_size=len(harmonic_cohort),
@@ -659,6 +716,13 @@ def _score_one_benchmark_row(
         if est is None:
             return
         bucket = accuracy.setdefault(provider, {}).setdefault(metric.value, MetricBucket())
+        if _estimate_declined(est):
+            # Pipeline declined to estimate this month - the stored
+            # ``estimated_headcount`` is a placeholder, not a guess. Count
+            # it as a coverage gap and move on; rolling it into MAPE
+            # would hide accuracy on companies we *did* estimate.
+            bucket.skipped_declined += 1
+            return
         overlap = _intervals_overlap(est.value_min, est.value_max, bench.value_min, bench.value_max)
         if cfg.credit_interval_overlap and overlap:
             bucket.n += 1
@@ -696,9 +760,14 @@ def _score_one_benchmark_row(
     if metric in _GROWTH_METRIC_TO_LABEL:
         label = _GROWTH_METRIC_TO_LABEL[metric]
         point = growth_points.get(label)
-        if point is None or point.value_point is None:
-            return
         bucket = growth_accuracy.setdefault(provider, {}).setdefault(label, MetricBucket())
+        if point is None or point.value_point is None:
+            # latest_growth_windows already drops declined endpoints
+            # (see headcount.estimate.growth._compute), so a missing
+            # point here means the estimator refused to publish growth
+            # for this company. Record the coverage gap.
+            bucket.skipped_declined += 1
+            return
         # Benchmark is a percentage like 5.1 meaning +5.1%; growth_point
         # is a ratio like 0.051. Convert benchmark to ratio to compare.
         bench_ratio = float(value_point) / 100.0
@@ -737,6 +806,7 @@ def persist_scoreboard(
         companies_in_scope=scoreboard.companies_in_scope,
         companies_evaluated=scoreboard.companies_evaluated,
         companies_with_benchmark=scoreboard.companies_with_benchmark,
+        companies_declined_to_estimate=scoreboard.companies_declined_to_estimate,
         harmonic_cohort_size=scoreboard.harmonic_cohort_size,
         harmonic_cohort_evaluated=scoreboard.harmonic_cohort_evaluated,
         coverage_in_scope=scoreboard.coverage_in_scope,

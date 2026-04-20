@@ -64,7 +64,13 @@ def session() -> Iterator[Session]:
 def test_metric_bucket_empty_summary() -> None:
     b = MetricBucket()
     s = b.summary()
-    assert s == {"n": 0, "mae": None, "mape": None, "median_abs_error": None}
+    assert s == {
+        "n": 0,
+        "mae": None,
+        "mape": None,
+        "median_abs_error": None,
+        "skipped_declined": 0,
+    }
 
 
 def test_metric_bucket_computes_mae_and_mape() -> None:
@@ -116,6 +122,9 @@ def _seed_estimate_row(
     month: date,
     value_point: float,
     band: ConfidenceBand = ConfidenceBand.medium,
+    method: EstimateMethod = EstimateMethod.interpolated_multi_anchor,
+    suppression_reason: str | None = None,
+    needs_review: bool = False,
 ) -> None:
     row = HeadcountEstimateMonthly(
         company_id=company.id,
@@ -126,10 +135,10 @@ def _seed_estimate_row(
         estimated_headcount_max=value_point * 1.5,
         public_profile_count=0,
         scaled_from_anchor_value=value_point,
-        method=EstimateMethod.interpolated_multi_anchor,
+        method=method,
         confidence_band=band,
-        needs_review=False,
-        suppression_reason=None,
+        needs_review=needs_review,
+        suppression_reason=suppression_reason,
     )
     session.add(row)
 
@@ -559,3 +568,111 @@ def test_rank_correlation_matches_harmonic_ordering(session: Session) -> None:
     assert rho is not None
     assert rho == pytest.approx(1.0, rel=1e-6)
     assert board.headline_spearman("1y") == pytest.approx(1.0, rel=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# BUG-B: declined estimates are excluded from accuracy
+# ---------------------------------------------------------------------------
+
+
+def test_evaluate_skips_declined_estimates(session: Session) -> None:
+    """A company whose pipeline declined to estimate must not poison MAPE.
+
+    Seeds one real company (350 estimate vs 350 benchmark = perfect) and
+    one declined company (0.0 placeholder vs 500 benchmark). Without the
+    BUG-B fix the declined row contributes a ~100% error term and drags
+    the MAPE up to ~0.5; with the fix the bucket stays perfect and the
+    declined company is surfaced via ``skipped_declined`` +
+    ``companies_declined_to_estimate`` instead.
+    """
+
+    real = _seed_company(session, "RealCo")
+    declined = _seed_company(session, "DeclinedCo")
+
+    real_ver = _seed_estimate_version(session, real)
+    _seed_estimate_row(
+        session,
+        company=real,
+        version_id=real_ver.id,
+        month=date(2026, 4, 1),
+        value_point=350.0,
+    )
+
+    declined_ver = _seed_estimate_version(session, declined)
+    _seed_estimate_row(
+        session,
+        company=declined,
+        version_id=declined_ver.id,
+        month=date(2026, 4, 1),
+        value_point=0.0,
+        band=ConfidenceBand.manual_review_required,
+        method=EstimateMethod.suppressed_low_sample,
+        suppression_reason="no_anchor_in_segment",
+        needs_review=True,
+    )
+
+    _seed_benchmark(
+        session,
+        company=real,
+        provider=BenchmarkProvider.harmonic,
+        metric=BenchmarkMetric.headcount_current,
+        as_of=date(2026, 4, 1),
+        value_point=350.0,
+    )
+    _seed_benchmark(
+        session,
+        company=declined,
+        provider=BenchmarkProvider.harmonic,
+        metric=BenchmarkMetric.headcount_current,
+        as_of=date(2026, 4, 1),
+        value_point=500.0,
+        row_index=2,
+    )
+    session.flush()
+
+    board = evaluate_against_benchmarks(session, as_of_month=date(2026, 4, 1))
+
+    assert board.companies_in_scope == 2
+    assert board.companies_evaluated == 2
+    assert board.companies_declined_to_estimate == 1
+
+    harm = board.accuracy["harmonic"]["headcount_current"]
+    assert harm["n"] == 1
+    assert harm["mape"] == 0.0
+    assert harm["skipped_declined"] == 1
+    assert board.headline_mape() == 0.0
+
+
+def test_evaluate_degraded_current_only_is_also_declined(session: Session) -> None:
+    """``degraded_current_only`` is a weak placeholder, not an estimate."""
+
+    co = _seed_company(session, "DegradedCo")
+    ver = _seed_estimate_version(session, co)
+    _seed_estimate_row(
+        session,
+        company=co,
+        version_id=ver.id,
+        month=date(2026, 4, 1),
+        value_point=200.0,
+        band=ConfidenceBand.low,
+        method=EstimateMethod.degraded_current_only,
+        suppression_reason="anchor_month_has_no_profiles",
+        needs_review=True,
+    )
+    _seed_benchmark(
+        session,
+        company=co,
+        provider=BenchmarkProvider.harmonic,
+        metric=BenchmarkMetric.headcount_current,
+        as_of=date(2026, 4, 1),
+        value_point=800.0,
+    )
+    session.flush()
+
+    board = evaluate_against_benchmarks(session, as_of_month=date(2026, 4, 1))
+
+    assert board.companies_declined_to_estimate == 1
+    harm = board.accuracy["harmonic"]["headcount_current"]
+    assert harm["n"] == 0
+    assert harm["skipped_declined"] == 1
+    assert board.headline_mape() is None
