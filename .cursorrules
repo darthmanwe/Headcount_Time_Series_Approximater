@@ -1,0 +1,94 @@
+# Project rule: headcount estimation system
+
+This repository builds an internal-use company headcount estimation system.
+
+Optimize for:
+- evidence traceability
+- deterministic pipelines
+- explicit interfaces
+- confidence gating
+- reviewability
+- local-first workflows
+
+Do not optimize for:
+- premature scale
+- commercial multi-tenancy
+- crawler tricks
+- opaque ML-based estimation
+
+# Architecture rule
+
+Keep these boundaries clean:
+
+- source adapters fetch and store evidence
+- parsers normalize observations
+- resolution resolves canonical companies
+- estimation produces monthly estimates and growth metrics
+- review handles manual overrides and queueing
+- serving exposes read APIs and exports
+
+Never let raw HTML flow directly into estimation logic.
+Never hide important policy decisions in ad hoc utility functions.
+
+# Source rule
+
+Supported source modes:
+1. first-party public web
+2. free-tier APIs / public datasets
+3. logged-out public LinkedIn observation path
+4. manual analyst validation
+
+Logged-out LinkedIn path constraints:
+- public pages only
+- no authentication
+- no CAPTCHA solving
+- no rotating proxies
+- no stealth browser logic
+- no retry logic meant to push through gating
+- fail closed on blocks or unstable access
+
+Always:
+- cache responses
+- persist raw evidence snapshots
+- version parsers
+- return typed normalized observations
+
+# Estimation rule
+
+The estimator must follow this method shape:
+
+- resolve canonical company
+- choose current anchor
+- normalize employment intervals
+- build monthly active public-profile counts
+- scale from current anchor
+- segment around events
+- detect anomalies
+- assign confidence
+- route weak estimates to review
+
+Entity resolution is the highest leverage layer.
+Do not emit long-window metrics without confidence gating.
+
+# Testing rule
+
+Required test layers:
+- unit tests for parsing and interval logic
+- integration tests for adapter -> parser -> storage flow
+- golden tests for estimation outputs on benchmark fixtures
+
+Tests must use stored fixtures.
+Do not depend on live web pages in CI tests.
+
+# Review rule
+
+Manual review is a first-class feature.
+
+Always include:
+- review queue items for low-confidence estimates
+- evidence trace views
+- override support
+- audit logging
+- rerun capability after override
+
+Never bury a low-confidence estimate as if it were final truth.
