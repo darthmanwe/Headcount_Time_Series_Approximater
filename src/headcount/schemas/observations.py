@@ -59,11 +59,7 @@ class CompanyAnchorObservation(StrictModel):
 
     @model_validator(mode="after")
     def _check_interval(self) -> CompanyAnchorObservation:
-        if not (
-            self.headcount_value_min
-            <= self.headcount_value_point
-            <= self.headcount_value_max
-        ):
+        if not (self.headcount_value_min <= self.headcount_value_point <= self.headcount_value_max):
             raise ValueError(
                 "anchor interval must satisfy min <= point <= max; "
                 f"got ({self.headcount_value_min}, {self.headcount_value_point}, "

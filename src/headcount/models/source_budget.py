@@ -32,10 +32,6 @@ class SourceBudget(UUIDPk, Timestamped, Base):
         nullable=False,
         default=SourceBudgetStatus.open,
     )
-    tripped_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    tripped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     trip_reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    consecutive_failures: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=0
-    )
+    consecutive_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

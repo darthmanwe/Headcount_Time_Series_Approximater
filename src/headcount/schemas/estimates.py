@@ -34,13 +34,9 @@ class HeadcountSeriesPoint(StrictModel):
     @model_validator(mode="after")
     def _check_interval(self) -> HeadcountSeriesPoint:
         if not (
-            self.estimated_headcount_min
-            <= self.estimated_headcount
-            <= self.estimated_headcount_max
+            self.estimated_headcount_min <= self.estimated_headcount <= self.estimated_headcount_max
         ):
-            raise ValueError(
-                "estimate interval must satisfy min <= point <= max"
-            )
+            raise ValueError("estimate interval must satisfy min <= point <= max")
         return self
 
 

@@ -59,9 +59,7 @@ class Settings(BaseSettings):
     linkedin_public_max_requests_per_run: int = Field(
         default=400, alias="LINKEDIN_PUBLIC_MAX_REQUESTS_PER_RUN", ge=0
     )
-    linkedin_public_max_rpm: int = Field(
-        default=6, alias="LINKEDIN_PUBLIC_MAX_RPM", ge=1
-    )
+    linkedin_public_max_rpm: int = Field(default=6, alias="LINKEDIN_PUBLIC_MAX_RPM", ge=1)
     linkedin_public_circuit_breaker_n: int = Field(
         default=5, alias="LINKEDIN_PUBLIC_CIRCUIT_BREAKER_N", ge=1
     )
@@ -72,9 +70,7 @@ class Settings(BaseSettings):
         default=90, alias="LINKEDIN_PUBLIC_PROFILE_TTL_DAYS", ge=0
     )
 
-    company_web_max_concurrency: int = Field(
-        default=4, alias="COMPANY_WEB_MAX_CONCURRENCY", ge=1
-    )
+    company_web_max_concurrency: int = Field(default=4, alias="COMPANY_WEB_MAX_CONCURRENCY", ge=1)
     sec_user_agent: str = Field(
         default="Headcount Estimator internal-use contact@example.com",
         alias="SEC_USER_AGENT",

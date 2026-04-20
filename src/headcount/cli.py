@@ -52,7 +52,9 @@ def root(
     ] = None,
     resume: Annotated[
         bool,
-        typer.Option("--resume/--no-resume", help="Resume a prior run instead of creating a new one."),
+        typer.Option(
+            "--resume/--no-resume", help="Resume a prior run instead of creating a new one."
+        ),
     ] = False,
     limit: Annotated[
         int | None,
@@ -64,7 +66,9 @@ def root(
     ] = None,
     dry_run: Annotated[
         bool,
-        typer.Option("--dry-run/--no-dry-run", help="Do not persist writes; log intended work only."),
+        typer.Option(
+            "--dry-run/--no-dry-run", help="Do not persist writes; log intended work only."
+        ),
     ] = False,
     version: Annotated[
         bool,
@@ -99,9 +103,36 @@ def seed_companies(
         Path,
         typer.Option("--input", "-i", exists=True, dir_okay=False, readable=True),
     ],
+    sheet: Annotated[
+        str | None,
+        typer.Option("--sheet", help="Force a specific sheet name; default is the active sheet."),
+    ] = None,
 ) -> None:
     """Import a priority-company list into ``company_candidate`` (Phase 2)."""
-    _not_yet_implemented(ctx, stage="seed-companies", input_path=str(input_path))
+    from headcount.db.engine import session_scope
+    from headcount.ingest.seeds import import_candidates
+
+    opts: GlobalOptions = ctx.obj
+    log = get_logger("headcount.cli.seed_companies")
+    with session_scope() as session:
+        result = import_candidates(session, input_path, sheet_name=sheet)
+        if opts.dry_run:
+            session.rollback()
+    log.info(
+        "seed_companies_done",
+        workbook=result.workbook,
+        sheet=result.sheet,
+        scanned=result.rows_scanned,
+        imported=result.rows_imported,
+        updated=result.rows_updated,
+        skipped=result.rows_skipped,
+        dry_run=opts.dry_run,
+    )
+    typer.echo(
+        f"seeded {result.rows_imported} new, {result.rows_updated} updated, "
+        f"{result.rows_skipped} skipped ({result.rows_scanned} scanned) "
+        f"from {result.workbook}:{result.sheet}"
+    )
 
 
 @app.command("load-benchmarks")
@@ -113,7 +144,30 @@ def load_benchmarks(
     ],
 ) -> None:
     """Load offline benchmark spreadsheets from ``test_source/`` (Phase 2)."""
-    _not_yet_implemented(ctx, stage="load-benchmarks", input_path=str(input_path))
+    from headcount.db.engine import session_scope
+    from headcount.ingest.seeds import load_benchmarks as _load_benchmarks
+
+    opts: GlobalOptions = ctx.obj
+    log = get_logger("headcount.cli.load_benchmarks")
+    with session_scope() as session:
+        result = _load_benchmarks(session, input_path)
+        if opts.dry_run:
+            session.rollback()
+    log.info(
+        "load_benchmarks_done",
+        workbook=result.workbook,
+        sheets=result.sheets_loaded,
+        observations_written=result.observations_written,
+        observations_updated=result.observations_updated,
+        event_candidates=result.event_candidates_written,
+        dry_run=opts.dry_run,
+    )
+    typer.echo(
+        f"loaded {result.observations_written} new observations, "
+        f"{result.observations_updated} updated, "
+        f"{result.event_candidates_written} event hints across "
+        f"{len(result.sheets_loaded)} sheets from {result.workbook}"
+    )
 
 
 @app.command("canonicalize")

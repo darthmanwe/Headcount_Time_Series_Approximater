@@ -32,9 +32,7 @@ class SourceObservation(UUIDPk, Timestamped, Base):
         nullable=False,
     )
     source_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
-    observed_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
-    )
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     raw_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     raw_html_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     raw_content_hash: Mapped[str] = mapped_column(String(128), nullable=False)

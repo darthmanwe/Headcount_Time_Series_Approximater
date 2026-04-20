@@ -185,3 +185,33 @@ class SourceBudgetStatus(enum.StrEnum):
     open = "open"
     tripped = "tripped"
     exhausted = "exhausted"
+
+
+class BenchmarkProvider(enum.StrEnum):
+    zeeshan = "zeeshan"
+    harmonic = "harmonic"
+    linkedin = "linkedin"
+
+
+class BenchmarkMetric(enum.StrEnum):
+    headcount_current = "headcount_current"
+    headcount_6m_ago = "headcount_6m_ago"
+    headcount_1y_ago = "headcount_1y_ago"
+    headcount_2y_ago = "headcount_2y_ago"
+    growth_6m_pct = "growth_6m_pct"
+    growth_1y_pct = "growth_1y_pct"
+    growth_2y_pct = "growth_2y_pct"
+    web_traffic = "web_traffic"
+
+
+class BenchmarkEventHintType(enum.StrEnum):
+    acquisition = "acquisition"
+    rebrand = "rebrand"
+    merger = "merger"
+    unknown = "unknown"
+
+
+class BenchmarkEventCandidateStatus(enum.StrEnum):
+    pending_merge = "pending_merge"
+    merged = "merged"
+    rejected = "rejected"

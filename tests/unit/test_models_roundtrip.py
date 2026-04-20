@@ -321,7 +321,14 @@ def test_estimate_version_reconciliation_confidence_and_rows(session: Session) -
         chosen_min=250.0,
         chosen_max=400.0,
         inputs_json=[
-            {"source": "linkedin_public", "point": 350, "min": 201, "max": 500, "weight": 0.6, "confidence": 0.7}
+            {
+                "source": "linkedin_public",
+                "point": 350,
+                "min": 201,
+                "max": 500,
+                "weight": 0.6,
+                "confidence": 0.7,
+            }
         ],
         weights_json={"linkedin_public": 0.6, "wikidata": 0.3, "company_web": 0.1},
         rationale="weighted by source confidence",
@@ -347,8 +354,13 @@ def test_estimate_version_reconciliation_confidence_and_rows(session: Session) -
     session.commit()
 
     assert session.execute(select(AnchorReconciliation)).scalar_one().chosen_point == 320.0
-    assert session.execute(select(ConfidenceComponentScore)).scalar_one().component_score == pytest.approx(0.85)
-    assert session.execute(select(HeadcountEstimateMonthly)).scalar_one().method is EstimateMethod.scaled_ratio_coverage_corrected
+    assert session.execute(
+        select(ConfidenceComponentScore)
+    ).scalar_one().component_score == pytest.approx(0.85)
+    assert (
+        session.execute(select(HeadcountEstimateMonthly)).scalar_one().method
+        is EstimateMethod.scaled_ratio_coverage_corrected
+    )
 
 
 def test_estimate_interval_check_rejects_inverted(session: Session) -> None:

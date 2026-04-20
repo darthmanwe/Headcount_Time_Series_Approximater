@@ -64,6 +64,4 @@ class CircuitBreaker:
         raise NotImplementedError("CircuitBreaker.record is implemented in Phase 4")
 
     def should_short_circuit(self) -> bool:  # pragma: no cover - Phase 4
-        raise NotImplementedError(
-            "CircuitBreaker.should_short_circuit is implemented in Phase 4"
-        )
+        raise NotImplementedError("CircuitBreaker.should_short_circuit is implemented in Phase 4")

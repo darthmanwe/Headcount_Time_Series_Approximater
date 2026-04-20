@@ -33,12 +33,8 @@ class Run(UUIDPk, Timestamped, Base):
         nullable=False,
         default=RunStatus.started,
     )
-    started_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
-    )
-    finished_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     cutoff_month: Mapped[date] = mapped_column(nullable=False)
     method_version: Mapped[str] = mapped_column(String(64), nullable=False)
     anchor_policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -54,9 +50,7 @@ class Run(UUIDPk, Timestamped, Base):
 class CompanyRunStatus(UUIDPk, Timestamped, Base):
     __tablename__ = "company_run_status"
     __table_args__ = (
-        UniqueConstraint(
-            "run_id", "company_id", "stage", name="uq_company_run_stage"
-        ),
+        UniqueConstraint("run_id", "company_id", "stage", name="uq_company_run_stage"),
     )
 
     run_id: Mapped[str] = mapped_column(

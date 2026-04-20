@@ -33,9 +33,7 @@ def test_single_head_revision() -> None:
     assert len(heads) == 1, f"expected one head revision, got {heads}"
 
 
-def test_upgrade_creates_all_tables(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_upgrade_creates_all_tables(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     db_path = tmp_path / "alembic.sqlite"
     url = f"sqlite:///{db_path}"
     monkeypatch.setenv("DB_URL", url)
@@ -50,9 +48,7 @@ def test_upgrade_creates_all_tables(
     assert expected.issubset(existing), expected - existing
 
 
-def test_downgrade_base_drops_tables(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_downgrade_base_drops_tables(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     db_path = tmp_path / "alembic-down.sqlite"
     url = f"sqlite:///{db_path}"
     monkeypatch.setenv("DB_URL", url)

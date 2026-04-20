@@ -33,7 +33,5 @@ class ReviewQueueItem(UUIDPk, Timestamped, Base):
         default=ReviewStatus.open,
     )
     assigned_to: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    resolved_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     detail: Mapped[str | None] = mapped_column(String(2048), nullable=True)

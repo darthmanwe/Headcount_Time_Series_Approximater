@@ -25,6 +25,4 @@ class ManualOverride(UUIDPk, Timestamped, Base):
     override_value_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
     reason: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     entered_by: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    expires_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

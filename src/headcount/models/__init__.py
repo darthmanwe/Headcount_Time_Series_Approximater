@@ -10,6 +10,7 @@ from __future__ import annotations
 from headcount.db.base import Base
 from headcount.models.anchor_reconciliation import AnchorReconciliation
 from headcount.models.audit_log import AuditLog
+from headcount.models.benchmark import BenchmarkEventCandidate, BenchmarkObservation
 from headcount.models.company import Company
 from headcount.models.company_alias import CompanyAlias
 from headcount.models.company_anchor_observation import CompanyAnchorObservation
@@ -33,6 +34,8 @@ __all__ = [
     "AnchorReconciliation",
     "AuditLog",
     "Base",
+    "BenchmarkEventCandidate",
+    "BenchmarkObservation",
     "Company",
     "CompanyAlias",
     "CompanyAnchorObservation",
