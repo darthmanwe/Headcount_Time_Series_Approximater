@@ -37,6 +37,7 @@ from typing import Any
 from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
+from headcount.db.enums import EstimateMethod
 from headcount.models.anchor_reconciliation import AnchorReconciliation
 from headcount.models.audit_log import AuditLog
 from headcount.models.company import Company
@@ -47,7 +48,7 @@ from headcount.models.headcount_estimate_monthly import HeadcountEstimateMonthly
 from headcount.models.manual_override import ManualOverride
 from headcount.models.source_observation import SourceObservation
 
-EVIDENCE_VERSION = "evidence_v1"
+EVIDENCE_VERSION = "evidence_v2"
 """Bumped when the tree shape changes in a way consumers must adapt to."""
 
 
@@ -258,6 +259,123 @@ def _format_reconciliation(r: AnchorReconciliation) -> dict[str, Any]:
     }
 
 
+_GROWTH_HORIZONS: tuple[tuple[int, str], ...] = ((6, "6m"), (12, "1y"), (24, "2y"))
+"""Product-level growth horizons: (months_back, label)."""
+
+
+def _months_back(month: date, n: int) -> date:
+    year = month.year
+    m = month.month - n
+    while m <= 0:
+        m += 12
+        year -= 1
+    return date(year, m, 1)
+
+
+def _row_is_usable(row: HeadcountEstimateMonthly) -> bool:
+    """A growth endpoint must be a non-suppressed, positive estimate."""
+    return (
+        row.method
+        not in {
+            EstimateMethod.suppressed_low_sample,
+            EstimateMethod.degraded_current_only,
+        }
+        and float(row.estimated_headcount) > 0.0
+    )
+
+
+def compute_growth_windows(
+    session: Session,
+    *,
+    version_id: str,
+) -> list[dict[str, Any]]:
+    """Compute ``6m / 1y / 2y`` growth windows anchored at the latest month.
+
+    Pure read-only: loads every ``HeadcountEstimateMonthly`` row for the
+    version and produces ``GrowthWindow``-shaped dicts (matching
+    :class:`~headcount.schemas.estimates.GrowthWindow`). Endpoints that
+    are suppressed / degraded yield a ``suppressed=True`` window so the
+    UI can still show a row with a clear reason.
+    """
+
+    rows = list(
+        session.execute(
+            select(HeadcountEstimateMonthly)
+            .where(HeadcountEstimateMonthly.estimate_version_id == version_id)
+            .order_by(HeadcountEstimateMonthly.month)
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return []
+    by_month = {r.month: r for r in rows}
+    latest = rows[-1]
+    out: list[dict[str, Any]] = []
+    for months, label in _GROWTH_HORIZONS:
+        start_month = _months_back(latest.month, months)
+        start = by_month.get(start_month)
+        if start is None:
+            out.append(
+                {
+                    "window": label,
+                    "start_month": start_month.isoformat(),
+                    "end_month": latest.month.isoformat(),
+                    "start_value": None,
+                    "end_value": None,
+                    "absolute_delta": None,
+                    "percent_delta": None,
+                    "confidence_band": latest.confidence_band.value,
+                    "suppressed": True,
+                    "suppression_reason": "no_estimate_at_start_month",
+                }
+            )
+            continue
+        if not _row_is_usable(start) or not _row_is_usable(latest):
+            out.append(
+                {
+                    "window": label,
+                    "start_month": start_month.isoformat(),
+                    "end_month": latest.month.isoformat(),
+                    "start_value": float(start.estimated_headcount),
+                    "end_value": float(latest.estimated_headcount),
+                    "absolute_delta": None,
+                    "percent_delta": None,
+                    "confidence_band": latest.confidence_band.value,
+                    "suppressed": True,
+                    "suppression_reason": (
+                        start.suppression_reason or latest.suppression_reason or "endpoint_suppressed"
+                    ),
+                }
+            )
+            continue
+        start_point = float(start.estimated_headcount)
+        end_point = float(latest.estimated_headcount)
+        absolute_delta = end_point - start_point
+        percent_delta = (end_point / start_point) - 1.0 if start_point > 0.0 else None
+        # Weakest band among the two endpoints propagates to the window.
+        band = (
+            latest.confidence_band
+            if latest.confidence_band.value >= start.confidence_band.value
+            else start.confidence_band
+        )
+        out.append(
+            {
+                "window": label,
+                "start_month": start_month.isoformat(),
+                "end_month": latest.month.isoformat(),
+                "start_value": start_point,
+                "end_value": end_point,
+                "absolute_delta": absolute_delta,
+                "percent_delta": percent_delta,
+                "confidence_band": band.value,
+                "suppressed": False,
+                "suppression_reason": None,
+            }
+        )
+    return out
+
+
 def _format_estimate(est: HeadcountEstimateMonthly) -> dict[str, Any]:
     return {
         "month": est.month.isoformat(),
@@ -329,6 +447,7 @@ def build_evidence(
         session, company_id=company_id, at=datetime.now(tz=UTC)
     )
     audit_rows = _load_audit_for_version(session, version_id=version.id)
+    growth_windows = compute_growth_windows(session, version_id=version.id)
 
     return {
         "evidence_version": EVIDENCE_VERSION,
@@ -363,6 +482,7 @@ def build_evidence(
             },
         },
         "reconciled_anchors": [_format_reconciliation(r) for r in recon_rows],
+        "growth": growth_windows,
         "confidence": {
             "band": estimate.confidence_band.value,
             "score": estimate.confidence_score,
@@ -383,4 +503,9 @@ def build_evidence(
     }
 
 
-__all__ = ["EVIDENCE_VERSION", "EvidenceNotFoundError", "build_evidence"]
+__all__ = [
+    "EVIDENCE_VERSION",
+    "EvidenceNotFoundError",
+    "build_evidence",
+    "compute_growth_windows",
+]

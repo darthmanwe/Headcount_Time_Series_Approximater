@@ -63,6 +63,8 @@ from headcount.estimate.reconcile import (
     DEFAULT_SAMPLE_FLOOR,
     METHOD_VERSION,
     MonthlyEstimate,
+    has_employment_signal,
+    interpolate_series_from_anchors,
     reconcile_series,
 )
 from headcount.estimate.segments import Segment, split_into_segments
@@ -593,14 +595,25 @@ def estimate_company(
                 segment_start=seg.start_month,
                 segment_end=seg.end_month,
             )
-            rows = reconcile_series(
-                seg,
-                anchor=reconciled,
-                monthly_profiles=monthly_profiles,
-                coverage=coverage,
-                as_of_month=_month_floor(as_of_month),
-                sample_floor=sample_floor,
-            )
+            interp_rows: list[MonthlyEstimate] | None = None
+            seg_months = seg.months()
+            if not has_employment_signal(
+                seg_months, monthly_profiles, sample_floor=sample_floor
+            ):
+                interp_rows = interpolate_series_from_anchors(
+                    seg, segment_anchors=seg_anchors
+                )
+            if interp_rows is not None:
+                rows = interp_rows
+            else:
+                rows = reconcile_series(
+                    seg,
+                    anchor=reconciled,
+                    monthly_profiles=monthly_profiles,
+                    coverage=coverage,
+                    as_of_month=_month_floor(as_of_month),
+                    sample_floor=sample_floor,
+                )
             rows = _apply_suppress_windows(rows, overrides)
             flags = detect_anomalies(rows, segment_break_months=set(break_months_tuple))
             confidences = _score_segment(

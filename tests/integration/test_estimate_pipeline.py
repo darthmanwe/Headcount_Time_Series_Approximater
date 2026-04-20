@@ -438,3 +438,97 @@ def test_company_with_no_anchors_fails_closed(session: Session) -> None:
     assert len(rows) == 3
     assert all(r.method is EstimateMethod.suppressed_low_sample for r in rows)
     assert all(r.suppression_reason == "no_anchor_in_segment" for r in rows)
+
+
+def test_pipeline_interpolates_when_only_benchmark_anchors_exist(
+    session: Session,
+) -> None:
+    """With >=2 anchors and no employment, we should interpolate.
+
+    This is the critical path that makes the estimator operational
+    without licensed per-person data - the benchmark promoter lands
+    historical anchors, and this test verifies the reconcile layer
+    turns them into a full monthly series.
+    """
+
+    company = _make_company(session, name="Benchmark Only Inc")
+    _add_anchor(
+        session,
+        company,
+        month=date(2024, 1, 1),
+        point=200,
+        vmin=180,
+        vmax=220,
+        type_=AnchorType.historical_statement,
+        conf=0.55,
+    )
+    _add_anchor(
+        session,
+        company,
+        month=date(2024, 7, 1),
+        point=500,
+        vmin=480,
+        vmax=520,
+        type_=AnchorType.historical_statement,
+        conf=0.55,
+    )
+    _add_anchor(
+        session,
+        company,
+        month=date(2025, 1, 1),
+        point=800,
+        vmin=780,
+        vmax=820,
+        type_=AnchorType.current_headcount_anchor,
+        conf=0.60,
+    )
+    # Deliberately seed zero PersonEmploymentObservation rows.
+
+    result = estimate_series(
+        session,
+        start_month=date(2023, 10, 1),
+        end_month=date(2025, 3, 1),
+        as_of_month=date(2025, 3, 1),
+        sample_floor=5,
+    )
+    assert result.companies_attempted == 1
+    version = (
+        session.execute(
+            select(EstimateVersion).where(EstimateVersion.company_id == company.id)
+        )
+        .scalars()
+        .one()
+    )
+    rows = (
+        session.execute(
+            select(HeadcountEstimateMonthly)
+            .where(HeadcountEstimateMonthly.estimate_version_id == version.id)
+            .order_by(HeadcountEstimateMonthly.month)
+        )
+        .scalars()
+        .all()
+    )
+    assert {r.method for r in rows} == {EstimateMethod.interpolated_multi_anchor}
+    by_month = {r.month: r for r in rows}
+    # Interpolation should be monotonically increasing through the
+    # known anchors (200 -> 500 -> 800).
+    jan = by_month[date(2024, 1, 1)]
+    apr = by_month[date(2024, 4, 1)]
+    jul = by_month[date(2024, 7, 1)]
+    oct_24 = by_month[date(2024, 10, 1)]
+    jan_25 = by_month[date(2025, 1, 1)]
+    assert jan.estimated_headcount == pytest.approx(200.0, abs=0.5)
+    assert apr.estimated_headcount == pytest.approx(350.0, abs=0.5)
+    assert jul.estimated_headcount == pytest.approx(500.0, abs=0.5)
+    assert oct_24.estimated_headcount == pytest.approx(650.0, abs=0.5)
+    assert jan_25.estimated_headcount == pytest.approx(800.0, abs=0.5)
+
+    # Months before the first anchor are extrapolated and must be
+    # flagged for review.
+    pre = by_month[date(2023, 11, 1)]
+    assert pre.needs_review
+    assert pre.suppression_reason == "extrapolated_beyond_anchor_range"
+    # Months after the last anchor too.
+    post = by_month[date(2025, 3, 1)]
+    assert post.needs_review
+    assert post.suppression_reason == "extrapolated_beyond_anchor_range"

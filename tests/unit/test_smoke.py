@@ -74,12 +74,13 @@ def test_cli_version_command() -> None:
     assert __version__ in result.output
 
 
-def test_cli_stub_returns_exit_code_two() -> None:
-    # ``collect-employment`` is still a Phase 7.5+ stub and returns
-    # exit_code=2 until wired.
+def test_cli_collect_employment_runs() -> None:
+    # ``collect-employment`` was a stub through Phase 10. Phase 10.5
+    # wired it to the benchmark-anchor promoter + optional CSV / OCR
+    # adapters; the command must now exit 0 even against an empty DB.
     runner = CliRunner()
     result = runner.invoke(cli_app, ["collect-employment", "--company-batch", "smoke"])
-    assert result.exit_code == 2
+    assert result.exit_code == 0, result.output
 
 
 def test_api_healthz_and_metrics() -> None:

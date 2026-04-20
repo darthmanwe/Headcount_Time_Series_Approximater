@@ -160,6 +160,21 @@ def test_export_review_queue_open_only(tmp_path: Path, session: Session) -> None
     assert payload[0]["priority"] == 80
 
 
+def test_export_growth_windows_csv(tmp_path: Path, session: Session) -> None:
+    _seed(session)
+    out = tmp_path / "growth.csv"
+    result = export_table(session, table="growth_windows", path=out, fmt="csv")
+    # 3 horizons per company, 1 company
+    assert result.rows == 3
+    with out.open(encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    windows = {r["window"] for r in rows}
+    assert windows == {"6m", "1y", "2y"}
+    # Fixture has 3 months of estimates (2023-06..2023-08). 6m/1y/2y
+    # windows all have no start-month estimate, so they're suppressed.
+    assert {r["suppressed"] for r in rows} == {"True"}
+
+
 def test_export_rejects_unknown_format(tmp_path: Path, session: Session) -> None:
     with pytest.raises(ExportFormatError):
         export_table(session, table="monthly_series", path=tmp_path / "x.xml", fmt="xml")

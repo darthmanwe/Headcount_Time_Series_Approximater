@@ -24,6 +24,9 @@ Modules
 - :mod:`headcount.parsers.event_merge` - deterministic merge and
   precedence policy that collapses duplicate events from multiple
   provenances into a single canonical row.
+- :mod:`headcount.parsers.benchmark_anchors` - promotion of benchmark
+  headcount observations into ``CompanyAnchorObservation`` rows so
+  analyst spreadsheet numbers feed the estimator directly.
 """
 
 from headcount.parsers.anchors import (
@@ -43,6 +46,11 @@ from headcount.parsers.anchors import (
     parse_company_web_text,
     parse_sec_company_facts,
     parse_wikidata_row,
+)
+from headcount.parsers.benchmark_anchors import (
+    BENCHMARK_ANCHOR_PARSER_VERSION,
+    PromotionResult,
+    promote_benchmark_anchors,
 )
 from headcount.parsers.dates import (
     DATES_PARSER_VERSION,
@@ -65,6 +73,7 @@ from headcount.parsers.events import (
 )
 
 __all__ = [
+    "BENCHMARK_ANCHOR_PARSER_VERSION",
     "BENCHMARK_EVENT_DEFAULT_CONFIDENCE",
     "COMPANY_WEB_PARSER_VERSION",
     "DATES_PARSER_VERSION",
@@ -79,6 +88,7 @@ __all__ = [
     "ParsedMonth",
     "ParsedMonthRange",
     "PromoteResult",
+    "PromotionResult",
     "SecEmployeeRow",
     "WikidataAnchor",
     "clean_html_to_text",
@@ -93,5 +103,6 @@ __all__ = [
     "parse_month_range",
     "parse_sec_company_facts",
     "parse_wikidata_row",
+    "promote_benchmark_anchors",
     "promote_benchmark_events",
 ]

@@ -35,7 +35,7 @@ def _ok(
 
 def test_version_constants_stable() -> None:
     assert ANOMALIES_VERSION == "anomalies_v1"
-    assert GROWTH_VERSION == "growth_v1"
+    assert GROWTH_VERSION == "growth_v2"
 
 
 def test_no_anomalies_on_smooth_series() -> None:
@@ -104,20 +104,38 @@ def test_coverage_floor_hit_flag() -> None:
     assert flags[0].coverage_floor_hit is True
 
 
-def test_growth_series_computes_mom_qoq_yoy() -> None:
+def test_growth_series_default_horizons_are_6m_1y_2y() -> None:
+    """Product contract: default horizons emit labels '6m' / '1y' / '2y'."""
+    series = [
+        _ok(date(2021, 1, 1), 80),
+        _ok(date(2022, 1, 1), 100),
+        _ok(date(2022, 7, 1), 120),
+        _ok(date(2023, 1, 1), 150),
+    ]
+    points = compute_growth_series(series)
+    horizons = {(p.month, p.horizon) for p in points}
+    assert (date(2023, 1, 1), "6m") in horizons
+    assert (date(2023, 1, 1), "1y") in horizons
+    assert (date(2023, 1, 1), "2y") in horizons
+    # 1m / 3m / 12m must NOT appear by default - they are opt-in.
+    assert not any(p.horizon in {"1m", "3m", "12m"} for p in points)
+    yoy = next(p for p in points if p.month == date(2023, 1, 1) and p.horizon == "1y")
+    assert yoy.value_point == pytest.approx(0.5)
+
+
+def test_growth_series_internal_short_horizons_still_supported() -> None:
     series = [
         _ok(date(2022, 1, 1), 100),
         _ok(date(2022, 4, 1), 110),
         _ok(date(2022, 12, 1), 140),
         _ok(date(2023, 1, 1), 150),
     ]
-    points = compute_growth_series(series)
+    points = compute_growth_series(series, horizons=(1, 3, 12))
     horizons = {(p.month, p.horizon) for p in points}
     assert (date(2023, 1, 1), "1m") in horizons
     assert (date(2023, 1, 1), "3m") not in horizons  # no Oct 2022 in series
-    assert (date(2023, 1, 1), "12m") in horizons
-    yoy = next(p for p in points if p.month == date(2023, 1, 1) and p.horizon == "12m")
-    assert yoy.value_point == pytest.approx(0.5)
+    # 12-month horizon is canonically labeled "1y" regardless of call site.
+    assert (date(2023, 1, 1), "1y") in horizons
 
 
 def test_growth_returns_nothing_for_suppressed_endpoints() -> None:

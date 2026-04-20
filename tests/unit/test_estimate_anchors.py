@@ -121,6 +121,54 @@ def test_interval_envelope_is_union_of_tier() -> None:
     assert r.value_max == pytest.approx(800.0)
 
 
+def test_anchor_month_follows_evidence_not_segment_midpoint() -> None:
+    """Regression: segment is 2020-01..2026-04 but all anchors sit near 2026-01.
+
+    Previously ``anchor_month`` was forced to the segment midpoint
+    (~2023-02), which made ratio-scaling look up the wrong profile
+    sample and could trigger ``degraded_current_only`` spuriously. The
+    reconciled anchor_month must now land within a few months of the
+    real anchors.
+    """
+    a = _a(point=480, month=date(2026, 1, 1), conf=0.8, oid="sec1")
+    b = _a(point=500, month=date(2026, 2, 1), conf=0.6, oid="li1")
+    r = reconcile_segment_anchors(
+        [a, b],
+        segment_start=date(2020, 1, 1),
+        segment_end=date(2026, 4, 1),
+    )
+    assert r is not None
+    assert r.anchor_month.year == 2026
+    assert r.anchor_month.month in (1, 2)
+
+
+def test_anchor_month_is_weighted_centroid() -> None:
+    """Heavier-weighted anchor pulls ``anchor_month`` toward its month."""
+    early = _a(point=500, month=date(2022, 1, 1), conf=0.1, oid="e")
+    late = _a(point=500, month=date(2024, 1, 1), conf=0.9, oid="l")
+    r = reconcile_segment_anchors(
+        [early, late],
+        segment_start=date(2020, 1, 1),
+        segment_end=date(2025, 12, 1),
+    )
+    assert r is not None
+    # Weighted centroid of ord(2022-01)=24264 and ord(2024-01)=24288:
+    # (24264*0.1 + 24288*0.9) = 24285.6 -> round to 24286 -> 2023-11.
+    assert r.anchor_month == date(2023, 11, 1)
+
+
+def test_anchor_month_clamped_into_segment() -> None:
+    """An anchor outside the segment cannot drag anchor_month outside it."""
+    out = _a(point=500, month=date(2030, 1, 1), conf=0.9, oid="x")
+    r = reconcile_segment_anchors(
+        [out],
+        segment_start=date(2020, 1, 1),
+        segment_end=date(2022, 12, 1),
+    )
+    assert r is not None
+    assert date(2020, 1, 1) <= r.anchor_month <= date(2022, 12, 1)
+
+
 def test_decay_half_life_downweights_distant_anchors() -> None:
     old = _a(point=400, month=date(2020, 1, 1), conf=0.9, oid="old")
     new = _a(point=800, month=date(2023, 6, 1), conf=0.9, oid="new")

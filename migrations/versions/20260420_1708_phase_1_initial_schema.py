@@ -1,7 +1,7 @@
 """phase_1_initial_schema
 
 Revision ID: 1f3e410c2a2f
-Revises: 
+Revises:
 Create Date: 2026-04-20 17:08:15.592230+00:00
 
 """
@@ -9,9 +9,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from alembic import op
 import sqlalchemy as sa
-
+from alembic import op
 
 revision: str = '1f3e410c2a2f'
 down_revision: str | None = None

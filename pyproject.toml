@@ -49,6 +49,10 @@ review = [
   "streamlit>=1.36",
   "plotly>=5.22",
 ]
+ocr = [
+  "pytesseract>=0.3.10",
+  "pillow>=10.3",
+]
 
 [project.scripts]
 hc = "headcount.cli:app"

@@ -117,6 +117,26 @@ def _segment_center(start_month: date, end_month: date) -> date:
     return date(year, month, 1)
 
 
+def _month_ordinal(m: date) -> int:
+    """Month index since the epoch 1970-01, first-of-month semantics."""
+    return m.year * 12 + (m.month - 1)
+
+
+def _ordinal_to_month(ordinal: int) -> date:
+    """Inverse of :func:`_month_ordinal`."""
+    year, month_zero = divmod(ordinal, 12)
+    return date(year, month_zero + 1, 1)
+
+
+def _clamp_month(m: date, *, lo: date, hi: date) -> date:
+    """Clamp ``m`` into ``[lo, hi]`` in month units (inclusive)."""
+    if m < lo:
+        return lo
+    if m > hi:
+        return hi
+    return m
+
+
 def reconcile_segment_anchors(
     anchors: list[AnchorCandidate],
     *,
@@ -148,8 +168,13 @@ def reconcile_segment_anchors(
     else:
         point_pool = list(tier)
 
-    # Confidence * proximity weighting for the point estimate.
+    # Confidence * proximity weighting for the point estimate. We reuse
+    # the same per-anchor weights to compute the reconciled ``anchor_month``
+    # as a weighted centroid of the contributing anchors' months, so
+    # downstream ratio-scaling uses the month where the evidence actually
+    # sits (not the segment midpoint).
     weighted_sum = 0.0
+    weighted_month_sum = 0.0
     weight_total = 0.0
     per_id_weight: dict[str, float] = {}
     contributing: list[str] = []
@@ -160,14 +185,15 @@ def reconcile_segment_anchors(
         if w == 0.0:
             continue
         weighted_sum += a.value_point * w
+        weighted_month_sum += _month_ordinal(a.anchor_month) * w
         weight_total += w
         if a.observation_id:
             per_id_weight[a.observation_id] = w
             contributing.append(a.observation_id)
 
     if weight_total == 0.0:
-        # Degenerate: everything had zero weight. Fall back to tier median
-        # by anchor_month, then by confidence, then by id.
+        # Degenerate: everything had zero weight. Fall back to the
+        # latest-observed anchor by (month desc, confidence desc, id).
         fallback = sorted(
             point_pool,
             key=lambda a: (
@@ -177,11 +203,21 @@ def reconcile_segment_anchors(
             ),
         )[-1]
         point = fallback.value_point
+        anchor_month = fallback.anchor_month
         if fallback.observation_id:
             per_id_weight[fallback.observation_id] = 1.0
             contributing.append(fallback.observation_id)
     else:
         point = weighted_sum / weight_total
+        # Round the centroid to the nearest month to stay on first-of-month
+        # discretization, then clamp into the segment so the downstream
+        # reconciler never looks up a month outside the segment window.
+        centroid_ordinal = round(weighted_month_sum / weight_total)
+        anchor_month = _clamp_month(
+            _ordinal_to_month(centroid_ordinal),
+            lo=segment_start,
+            hi=segment_end,
+        )
 
     # Interval envelope: union over the top tier. Low-precedence anchors
     # still widen the interval if they're wider than the tier envelope -
@@ -203,11 +239,11 @@ def reconcile_segment_anchors(
     rationale = (
         f"tier={top_kinds} n_top={len(tier)} "
         f"n_point={len(point_pool)} has_precise={has_precise} "
-        f"center={center.isoformat()}"
+        f"center={center.isoformat()} anchor_month={anchor_month.isoformat()}"
     )
 
     return ReconciledAnchor(
-        anchor_month=center,
+        anchor_month=anchor_month,
         value_min=low,
         value_point=point,
         value_max=high,

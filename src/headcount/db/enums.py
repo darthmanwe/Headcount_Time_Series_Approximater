@@ -107,6 +107,7 @@ class EstimateMethod(enum.StrEnum):
     scaled_ratio_coverage_corrected = "scaled_ratio_coverage_corrected"
     degraded_current_only = "degraded_current_only"
     suppressed_low_sample = "suppressed_low_sample"
+    interpolated_multi_anchor = "interpolated_multi_anchor"
 
 
 class EstimateVersionStatus(enum.StrEnum):

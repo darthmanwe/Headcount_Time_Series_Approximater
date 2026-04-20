@@ -105,6 +105,38 @@ with left:
     fig = build_series_figure(df, events=events, overrides=overrides)
     st.plotly_chart(fig, use_container_width=True)
 
+    # 6m / 1y / 2y product growth windows anchored at the latest month.
+    if version_id is not None:
+        try:
+            growth_resp = client.get_company_growth(selected_id)
+        except ApiError as exc:
+            st.warning(f"Could not load growth windows: {exc.detail}")
+        else:
+            windows = growth_resp.get("windows") or []
+            if windows:
+                st.caption("Growth vs. latest month")
+                gcols = st.columns(len(windows))
+                for idx, w in enumerate(windows):
+                    label = f"{w['window']} growth"
+                    if w.get("suppressed") or w.get("percent_delta") is None:
+                        gcols[idx].metric(
+                            label,
+                            "n/a",
+                            help=w.get("suppression_reason") or "no data",
+                        )
+                    else:
+                        pct = float(w["percent_delta"]) * 100.0
+                        gcols[idx].metric(
+                            label,
+                            f"{pct:+.1f}%",
+                            delta=(
+                                f"{w.get('absolute_delta'):+.0f}"
+                                if w.get("absolute_delta") is not None
+                                else None
+                            ),
+                            help=f"{w['start_month']} -> {w['end_month']} (band: {w['confidence_band']})",
+                        )
+
     if not df.empty:
         st.dataframe(
             df[

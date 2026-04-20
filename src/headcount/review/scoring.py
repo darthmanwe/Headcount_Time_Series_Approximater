@@ -270,6 +270,19 @@ def score_confidence(
         if band in (ConfidenceBand.high, ConfidenceBand.medium):
             band = ConfidenceBand.low
         note = "degraded_current_only"
+    elif inputs.estimate.method is EstimateMethod.interpolated_multi_anchor:
+        # Interpolation between analyst/benchmark anchors has no
+        # per-month employment evidence, so cap at ``medium`` and force
+        # ``low`` whenever the row is flagged for review (typically
+        # extrapolation beyond the anchor range).
+        if band is ConfidenceBand.high:
+            band = ConfidenceBand.medium
+        if inputs.estimate.needs_review and band in (
+            ConfidenceBand.medium,
+            ConfidenceBand.high,
+        ):
+            band = ConfidenceBand.low
+        note = "interpolated_multi_anchor"
 
     return ConfidenceBreakdown(
         month=inputs.estimate.month,

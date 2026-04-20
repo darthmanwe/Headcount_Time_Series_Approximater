@@ -445,11 +445,110 @@ def _offline_transport() -> Any:
 def collect_employment(
     ctx: typer.Context,
     company_batch: Annotated[str, typer.Option("--company-batch")] = "priority",
-    source: Annotated[str | None, typer.Option("--source")] = None,
+    source: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--source",
+            "-s",
+            help=(
+                "Employment-source hint (repeatable). Supported today: "
+                "'benchmark' (default), 'linkedin_ocr' (requires --enable-ocr "
+                "and pytesseract)."
+            ),
+        ),
+    ] = None,
+    profiles_csv: Annotated[
+        Path | None,
+        typer.Option(
+            "--profiles-csv",
+            help=(
+                "Optional CSV of public-profile employment rows. Columns: "
+                "person_source_key, company_id|company_domain, start_month, "
+                "end_month, is_current_role, display_name, job_title, "
+                "profile_url, confidence."
+            ),
+        ),
+    ] = None,
+    enable_ocr: Annotated[
+        bool,
+        typer.Option(
+            "--enable-ocr/--no-ocr",
+            help=(
+                "Enable the LinkedIn OCR growth-trend observer. Requires the "
+                "'[ocr]' optional dependency group."
+            ),
+        ),
+    ] = False,
+    company_limit: Annotated[
+        int | None,
+        typer.Option("--limit", help="Cap the number of companies processed."),
+    ] = None,
 ) -> None:
-    """Gather public employment-history observations (Phase 5/6)."""
-    _not_yet_implemented(
-        ctx, stage="collect-employment", company_batch=company_batch, source=source
+    """Gather public employment-history observations.
+
+    This stage is the bridge between raw benchmark data and the
+    estimator. It promotes benchmark observations to anchors, optionally
+    imports an analyst-supplied CSV of public profiles, and - behind
+    ``--enable-ocr`` - dispatches the logged-out LinkedIn OCR observer
+    for growth-trend extraction.
+    """
+
+    from sqlalchemy import select
+
+    from headcount.db.engine import session_scope
+    from headcount.ingest.employment import collect_employment as _collect
+    from headcount.models.company import Company
+
+    opts: GlobalOptions = ctx.obj
+    log = get_logger("headcount.cli.collect_employment")
+
+    sources = [s.strip().lower() for s in (source or []) if s.strip()]
+
+    ocr_observer: object | None = None
+    if enable_ocr or "linkedin_ocr" in sources:
+        try:
+            from headcount.ingest.observers.linkedin_ocr import (
+                LinkedInGrowthTrendObserver,
+            )
+
+            ocr_observer = LinkedInGrowthTrendObserver()
+            if "linkedin_ocr" not in sources:
+                sources.append("linkedin_ocr")
+        except Exception as exc:
+            log.warning(
+                "ocr_observer_unavailable",
+                error=str(exc),
+                hint="install the '[ocr]' extra to enable LinkedIn OCR",
+            )
+            ocr_observer = None
+
+    with session_scope() as session:
+        companies = list(
+            session.execute(select(Company).order_by(Company.canonical_name)).scalars()
+        )
+        if company_limit is not None:
+            companies = companies[:company_limit]
+        ids = [c.id for c in companies] if companies else None
+        result = _collect(
+            session,
+            company_ids=ids,
+            profiles_csv=profiles_csv,
+            sources=sources,
+            note=f"collect-employment batch={company_batch}",
+            ocr_observer=ocr_observer,
+        )
+        if opts.dry_run:
+            session.rollback()
+        summary = result.summary()
+
+    log.info("collect_employment_done", batch=company_batch, **summary, dry_run=opts.dry_run)
+    typer.echo(
+        f"run={summary['run_id']} companies={summary['companies_attempted']} "
+        f"succeeded={summary['companies_succeeded']} "
+        f"benchmark_anchors+={result.benchmark.inserted_anchor_rows} "
+        f"csv_rows+={result.csv.rows_imported} "
+        f"ocr_signals+={summary['ocr_signals']} "
+        f"errors={summary['errors']}"
     )
 
 
@@ -809,7 +908,7 @@ def export_growth(
         str,
         typer.Option(
             "--table",
-            help="One of: monthly_series, anchors, review_queue.",
+            help="One of: monthly_series, anchors, review_queue, growth_windows.",
         ),
     ] = "monthly_series",
     fmt: Annotated[
@@ -1118,6 +1217,338 @@ def review_ui_cmd(
         "true",
     ]
     subprocess.run(cmd, env=env, check=True)
+
+
+@app.command("run-pipeline")
+def run_pipeline(
+    ctx: typer.Context,
+    mode: Annotated[
+        str,
+        typer.Option(
+            "--mode",
+            help=(
+                "Execution mode: 'offline' (no network, default), "
+                "'live-safe' (network enabled, LinkedIn + OCR disabled), "
+                "'live-full' (full live fan-out; for final runs across "
+                "250-2000 companies)."
+            ),
+        ),
+    ] = "offline",
+    companies_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--companies",
+            help="Optional target-company workbook to seed before running.",
+        ),
+    ] = None,
+    benchmarks_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--benchmarks",
+            help="Optional benchmark workbook to load before running.",
+        ),
+    ] = None,
+    profiles_csv: Annotated[
+        Path | None,
+        typer.Option(
+            "--profiles-csv",
+            help="Optional analyst CSV of public-profile employment rows.",
+        ),
+    ] = None,
+    start_month: Annotated[
+        str, typer.Option("--start", help="First estimate month (YYYY-MM).")
+    ] = "2020-01",
+    end_month: Annotated[
+        str | None,
+        typer.Option("--end", help="Last estimate month; defaults to --as-of."),
+    ] = None,
+    as_of_month: Annotated[
+        str | None,
+        typer.Option(
+            "--as-of", help="Reference 'now' month; defaults to today's month."
+        ),
+    ] = None,
+    sample_floor: Annotated[
+        int,
+        typer.Option(
+            "--sample-floor",
+            help="Floor for the per-month public-profile count.",
+        ),
+    ] = 5,
+    company_limit: Annotated[
+        int | None,
+        typer.Option("--limit", help="Cap companies processed (smoke runs)."),
+    ] = None,
+    json_output: Annotated[
+        Path | None,
+        typer.Option(
+            "--json-out",
+            help=(
+                "Write the structured pipeline summary to this path. "
+                "Stdout always gets a compact one-liner."
+            ),
+        ),
+    ] = None,
+) -> None:
+    """Run the full pipeline end-to-end with a single command.
+
+    This is the operational lever: ``--mode offline`` is what you run in
+    tests, dev, and smoke; ``--mode live-safe`` enables network
+    observers (manual/sec/wikidata ``--live`` + company-web) with
+    LinkedIn scraping and OCR still disabled; ``--mode live-full``
+    turns everything on for a final 250-2000 company production pass.
+
+    Stages executed (each one is idempotent):
+
+    1. ``seed-companies`` (if ``--companies`` supplied).
+    2. ``load-benchmarks`` (if ``--benchmarks`` supplied).
+    3. ``canonicalize`` (pending candidates only).
+    4. ``parse-events`` (promote + merge).
+    5. ``collect-anchors`` (live observers in live modes).
+    6. ``collect-employment`` (benchmark promotion + CSV + OCR).
+    7. ``estimate-series`` across the full window.
+
+    The final JSON summary includes per-stage timing, per-stage row
+    counts, and the final ``run_id`` of the estimate-series run so
+    the review UI can deep-link to it.
+    """
+
+    import asyncio
+    import json
+    import time
+    from datetime import date
+
+    from sqlalchemy import select
+
+    from headcount.db.engine import session_scope
+    from headcount.db.enums import PriorityTier, SourceName
+    from headcount.estimate.pipeline import estimate_series as run_estimate
+    from headcount.ingest.collect import collect_anchors as _collect_anchors
+    from headcount.ingest.collect import default_http_configs
+    from headcount.ingest.employment import collect_employment as _collect_emp
+    from headcount.ingest.http import FileCache, HttpClient
+    from headcount.ingest.observers import (
+        CompanyWebObserver,
+        LinkedInPublicObserver,
+        ManualAnchorObserver,
+        SECObserver,
+        WikidataObserver,
+    )
+    from headcount.ingest.seeds import import_candidates, load_benchmarks
+    from headcount.models.company import Company
+    from headcount.parsers import merge_events, promote_benchmark_events
+    from headcount.resolution import resolve_candidates
+
+    opts: GlobalOptions = ctx.obj
+    log = get_logger("headcount.cli.run_pipeline")
+
+    mode_norm = mode.strip().lower()
+    if mode_norm not in {"offline", "live-safe", "live-full"}:
+        raise typer.BadParameter(
+            f"unknown --mode {mode!r}; expected offline|live-safe|live-full"
+        )
+    live = mode_norm in {"live-safe", "live-full"}
+    full_live = mode_norm == "live-full"
+
+    def _parse_month(raw: str) -> date:
+        raw = raw.strip()
+        if len(raw) == 7:
+            raw = f"{raw}-01"
+        try:
+            return date.fromisoformat(raw).replace(day=1)
+        except ValueError as exc:
+            raise typer.BadParameter(
+                f"expected YYYY-MM or YYYY-MM-DD, got {raw!r}"
+            ) from exc
+
+    start = _parse_month(start_month)
+    end = _parse_month(end_month) if end_month else None
+    as_of = _parse_month(as_of_month) if as_of_month else None
+
+    summary: dict[str, Any] = {
+        "mode": mode_norm,
+        "dry_run": opts.dry_run,
+        "stages": {},
+    }
+
+    def _record(name: str, started: float, payload: dict[str, Any]) -> None:
+        payload["elapsed_ms"] = int((time.time() - started) * 1000)
+        summary["stages"][name] = payload
+
+    async def _run_collect_anchors(
+        session: Any, companies: list[Company]
+    ) -> dict[str, object]:
+        settings = get_settings()
+        cache = FileCache(settings.cache_dir)
+        http = HttpClient(
+            cache=cache,
+            configs=default_http_configs(),
+            transport=None if live else _offline_transport(),
+        )
+        adapters: list[object] = [ManualAnchorObserver(), SECObserver(), WikidataObserver()]
+        if live:
+            adapters.append(CompanyWebObserver())
+        if full_live:
+            adapters.append(LinkedInPublicObserver())
+        result = await _collect_anchors(
+            session,
+            adapters=adapters,  # type: ignore[arg-type]
+            companies=companies,
+            http_client=http,
+        )
+        return result.summary()
+
+    ocr_observer: object | None = None
+    if full_live:
+        try:
+            from headcount.ingest.observers.linkedin_ocr import (
+                LinkedInGrowthTrendObserver,
+            )
+
+            ocr_observer = LinkedInGrowthTrendObserver()
+        except Exception as exc:
+            log.warning("ocr_observer_unavailable", error=str(exc))
+
+    with session_scope() as session:
+        # 1) Seed companies (optional).
+        if companies_path is not None:
+            t0 = time.time()
+            seed_result = import_candidates(session, companies_path)
+            _record(
+                "seed_companies",
+                t0,
+                {
+                    "workbook": seed_result.workbook,
+                    "sheet": seed_result.sheet,
+                    "rows_imported": seed_result.rows_imported,
+                    "rows_updated": seed_result.rows_updated,
+                    "rows_skipped": seed_result.rows_skipped,
+                },
+            )
+
+        # 2) Load benchmarks (optional).
+        if benchmarks_path is not None:
+            t0 = time.time()
+            bench_result = load_benchmarks(session, benchmarks_path)
+            _record(
+                "load_benchmarks",
+                t0,
+                {
+                    "workbook": bench_result.workbook,
+                    "sheets_loaded": list(bench_result.sheets_loaded),
+                    "observations_written": bench_result.observations_written,
+                    "event_candidates": bench_result.event_candidates_written,
+                },
+            )
+
+        # 3) Canonicalize.
+        t0 = time.time()
+        canon = resolve_candidates(
+            session, default_priority_tier=PriorityTier.P1, only_pending=True
+        )
+        _record(
+            "canonicalize",
+            t0,
+            {
+                "candidates_scanned": canon.candidates_scanned,
+                "candidates_resolved": canon.candidates_resolved,
+                "companies_created": canon.companies_created,
+                "aliases_created": canon.aliases_created,
+            },
+        )
+
+        # 4) Parse events.
+        t0 = time.time()
+        promote = promote_benchmark_events(session, only_pending=True)
+        merge = merge_events(session)
+        _record(
+            "parse_events",
+            t0,
+            {
+                "promoted": promote.promoted,
+                "duplicates_of_existing": promote.duplicates_of_existing_event,
+                "groups_collapsed": merge.groups_collapsed,
+                "rows_deleted": merge.rows_deleted,
+            },
+        )
+
+        # Resolve the batch after canonicalization so later stages
+        # operate on the full set.
+        companies = list(
+            session.execute(select(Company).order_by(Company.canonical_name)).scalars()
+        )
+        if company_limit is not None:
+            companies = companies[:company_limit]
+        company_ids = [c.id for c in companies]
+        summary["companies_in_scope"] = len(companies)
+
+        # 5) Collect anchors.
+        t0 = time.time()
+        anchor_summary = asyncio.run(_run_collect_anchors(session, companies))
+        _record("collect_anchors", t0, dict(anchor_summary))
+
+        # 6) Collect employment (benchmark promotion + optional CSV +
+        #    optional OCR in live-full).
+        t0 = time.time()
+        emp_sources: list[str] = []
+        if full_live and ocr_observer is not None:
+            emp_sources.append("linkedin_ocr")
+        emp_result = _collect_emp(
+            session,
+            company_ids=company_ids or None,
+            profiles_csv=profiles_csv,
+            sources=emp_sources,
+            note=f"run-pipeline mode={mode_norm}",
+            ocr_observer=ocr_observer,
+        )
+        _record("collect_employment", t0, emp_result.summary())
+
+        # 7) Estimate series over the requested window.
+        t0 = time.time()
+        est = run_estimate(
+            session,
+            start_month=start,
+            end_month=end,
+            as_of_month=as_of,
+            company_ids=company_ids or None,
+            sample_floor=sample_floor,
+            note=f"run-pipeline mode={mode_norm}",
+        )
+        _record(
+            "estimate_series",
+            t0,
+            {
+                "run_id": est.run_id,
+                "final_status": est.final_status.value,
+                "companies_attempted": est.companies_attempted,
+                "companies_succeeded": est.companies_succeeded,
+                "companies_failed": est.companies_failed,
+                "companies_degraded": est.companies_degraded,
+                "months_written": est.months_written,
+                "months_flagged": est.months_flagged,
+                "review_items_inserted": est.review_items_inserted,
+                "overrides_applied": est.overrides_applied,
+            },
+        )
+        summary["final_run_id"] = est.run_id
+        summary["final_status"] = est.final_status.value
+
+        if opts.dry_run:
+            session.rollback()
+
+    # Stderr/stdout surface: a compact one-liner for humans + optional
+    # JSON for automation.
+    if json_output is not None:
+        json_output.write_text(json.dumps(summary, indent=2, default=str))
+    _ = SourceName  # silence unused-import lint when SourceName is dropped
+    log.info("run_pipeline_done", **{k: v for k, v in summary.items() if k != "stages"})
+    typer.echo(
+        f"run-pipeline mode={mode_norm} "
+        f"companies={summary.get('companies_in_scope', 0)} "
+        f"run_id={summary.get('final_run_id')} "
+        f"status={summary.get('final_status')} "
+        f"months={summary['stages'].get('estimate_series', {}).get('months_written', 0)}"
+    )
 
 
 @app.command("version")

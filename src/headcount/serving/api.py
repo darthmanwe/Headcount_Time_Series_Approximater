@@ -52,7 +52,11 @@ from headcount.serving.benchmark_comparison import (
     ComparisonSummary,
     compare_estimates_to_benchmarks,
 )
-from headcount.serving.evidence import EvidenceNotFoundError, build_evidence
+from headcount.serving.evidence import (
+    EvidenceNotFoundError,
+    build_evidence,
+    compute_growth_windows,
+)
 from headcount.utils.logging import configure_logging, get_logger
 from headcount.utils.metrics import REGISTRY
 
@@ -88,6 +92,25 @@ class CompanySeriesResponse(_StrictModel):
     company: CompanySummary
     estimate_version_id: str | None
     months: list[MonthlyEstimateRow]
+
+
+class GrowthWindowRow(_StrictModel):
+    window: str = Field(pattern=r"^(6m|1y|2y)$")
+    start_month: date
+    end_month: date
+    start_value: float | None = None
+    end_value: float | None = None
+    absolute_delta: float | None = None
+    percent_delta: float | None = None
+    confidence_band: str
+    suppressed: bool = False
+    suppression_reason: str | None = None
+
+
+class CompanyGrowthResponse(_StrictModel):
+    company: CompanySummary
+    estimate_version_id: str | None
+    windows: list[GrowthWindowRow]
 
 
 class ReviewQueueRow(_StrictModel):
@@ -323,6 +346,43 @@ def create_app(session_factory: Any | None = None) -> FastAPI:
             company=_company_summary(company),
             estimate_version_id=version_id,
             months=rows,
+        )
+
+    @app.get(
+        "/companies/{company_id}/growth",
+        tags=["companies"],
+        response_model=CompanyGrowthResponse,
+    )
+    def get_company_growth(
+        company_id: str,
+        session: Session = Depends(get_session),
+    ) -> CompanyGrowthResponse:
+        """Product-contract ``6m / 1y / 2y`` growth windows.
+
+        Anchored at the latest available month in the company's most
+        recent :class:`EstimateVersion`. Each window carries the same
+        suppression semantics as the monthly series so analysts see a
+        row (with a clear reason) even when growth is undefined.
+        """
+        company = session.get(Company, company_id)
+        if company is None:
+            raise HTTPException(status_code=404, detail=f"company not found: {company_id}")
+        version_map = _latest_version_per_company(session, [company_id])
+        version_id = version_map.get(company_id)
+        if version_id is None:
+            return CompanyGrowthResponse(
+                company=_company_summary(company),
+                estimate_version_id=None,
+                windows=[],
+            )
+        windows = [
+            GrowthWindowRow(**w)
+            for w in compute_growth_windows(session, version_id=version_id)
+        ]
+        return CompanyGrowthResponse(
+            company=_company_summary(company),
+            estimate_version_id=version_id,
+            windows=windows,
         )
 
     @app.get(

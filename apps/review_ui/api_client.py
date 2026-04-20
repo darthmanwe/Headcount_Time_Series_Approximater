@@ -135,6 +135,9 @@ class HeadcountApiClient:
             self._request("GET", f"/companies/{company_id}/series", params=params)
         )
 
+    def get_company_growth(self, company_id: str) -> dict[str, Any]:
+        return dict(self._request("GET", f"/companies/{company_id}/growth"))
+
     def get_company_evidence(
         self,
         company_id: str,

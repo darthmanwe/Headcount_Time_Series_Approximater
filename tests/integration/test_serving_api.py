@@ -171,6 +171,29 @@ def test_company_evidence(client: TestClient, session_factory: sessionmaker[Sess
     assert tree["company"]["id"] == company.id
     assert tree["estimate"]["month"] == "2023-06-01"
     assert tree["inputs"]["anchors"]
+    # Evidence trace must include the 6m/1y/2y growth windows block
+    # (populated when enough monthly estimates exist; here we have 12
+    # months of history so the 6m window should be present).
+    windows = {w["window"] for w in tree["growth"]}
+    assert windows == {"6m", "1y", "2y"}
+
+
+def test_company_growth_endpoint(
+    client: TestClient, session_factory: sessionmaker[Session]
+) -> None:
+    with session_factory() as session:
+        company = _seed(session)
+    resp = client.get(f"/companies/{company.id}/growth")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["company"]["id"] == company.id
+    windows = {w["window"]: w for w in body["windows"]}
+    assert set(windows) == {"6m", "1y", "2y"}
+    # Only the 6m window has a start point in this fixture (end is
+    # 2023-12, 6m-ago = 2023-06 which exists; 1y/2y do not).
+    assert windows["6m"]["suppressed"] is False
+    assert windows["1y"]["suppressed"] is True
+    assert windows["2y"]["suppressed"] is True
 
 
 def test_company_evidence_404(client: TestClient, session_factory: sessionmaker[Session]) -> None:

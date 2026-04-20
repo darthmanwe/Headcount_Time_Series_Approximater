@@ -1,10 +1,12 @@
 """Deterministic export helpers.
 
-CSV / JSON / Parquet dumps of the three analyst-facing tables:
+CSV / JSON / Parquet dumps of the analyst-facing tables:
 
 - ``monthly_series``: latest ``HeadcountEstimateMonthly`` per company.
 - ``anchors``: ``CompanyAnchorObservation`` with source metadata.
 - ``review_queue``: all ``ReviewQueueItem`` rows with company name.
+- ``growth_windows``: 6m / 1y / 2y growth per company, anchored at the
+  latest estimate month.
 
 All exporters are pure in/out: they read the DB once, build a list of
 ``dict[str, Any]`` rows, and write to disk. Parquet is optional and only
@@ -219,10 +221,55 @@ def _review_queue_rows(
     return rows
 
 
+def _growth_windows_rows(
+    session: Session, *, company_ids: Iterable[str] | None = None
+) -> list[dict[str, Any]]:
+    """One row per (company, window) anchored at the latest estimate month."""
+    from headcount.serving.evidence import compute_growth_windows
+
+    version_map = _latest_version_per_company(session)
+    if not version_map:
+        return []
+    ids = set(company_ids) if company_ids is not None else None
+    # Maintain canonical_name ordering for deterministic output.
+    company_rows = list(
+        session.execute(
+            select(Company).order_by(Company.canonical_name)
+        ).scalars()
+    )
+    out: list[dict[str, Any]] = []
+    for company in company_rows:
+        if ids is not None and company.id not in ids:
+            continue
+        version_id = version_map.get(company.id)
+        if version_id is None:
+            continue
+        for w in compute_growth_windows(session, version_id=version_id):
+            out.append(
+                {
+                    "company_id": company.id,
+                    "canonical_name": company.canonical_name,
+                    "window": w["window"],
+                    "start_month": w["start_month"],
+                    "end_month": w["end_month"],
+                    "start_value": w["start_value"],
+                    "end_value": w["end_value"],
+                    "absolute_delta": w["absolute_delta"],
+                    "percent_delta": w["percent_delta"],
+                    "confidence_band": w["confidence_band"],
+                    "suppressed": w["suppressed"],
+                    "suppression_reason": w["suppression_reason"],
+                    "estimate_version_id": version_id,
+                }
+            )
+    return out
+
+
 _ROW_BUILDERS = {
     "monthly_series": _monthly_series_rows,
     "anchors": _anchors_rows,
     "review_queue": _review_queue_rows,
+    "growth_windows": _growth_windows_rows,
 }
 
 
@@ -238,7 +285,8 @@ def export_table(
     """Dump one of the canonical analyst tables to disk.
 
     ``table`` must be one of ``monthly_series``, ``anchors``,
-    ``review_queue``. Format is ``csv``, ``json``, or ``parquet``.
+    ``review_queue``, ``growth_windows``. Format is ``csv``, ``json``,
+    or ``parquet``.
     """
 
     fmt = fmt.lower()
