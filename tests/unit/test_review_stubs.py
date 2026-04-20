@@ -14,7 +14,6 @@ from headcount.db.enums import (
     PriorityTier,
     ReviewReason,
 )
-from headcount.ingest.policy import CircuitBreaker, TokenBucket
 from headcount.models import Base, Company, ManualOverride
 from headcount.review import EnqueueRequest, enqueue, get_active_overrides
 
@@ -82,12 +81,3 @@ def test_get_active_overrides_respects_expiry(session: Session) -> None:
     active = get_active_overrides(session, company.id)
     assert len(active) == 1
     assert active[0].field_name is OverrideField.current_anchor
-
-
-def test_policy_stubs_raise_not_implemented() -> None:
-    bucket = TokenBucket(capacity=10, refill_per_second=1.0)
-    with pytest.raises(NotImplementedError):
-        bucket.acquire()
-    breaker = CircuitBreaker(trip_after_n=5)
-    with pytest.raises(NotImplementedError):
-        breaker.record("error")

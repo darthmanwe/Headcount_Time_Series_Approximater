@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 
@@ -239,10 +239,125 @@ def canonicalize(
 def collect_anchors(
     ctx: typer.Context,
     company_batch: Annotated[str, typer.Option("--company-batch")] = "priority",
-    source: Annotated[str | None, typer.Option("--source")] = None,
+    source: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--source",
+            "-s",
+            help="Source name to enable (repeatable). Defaults to manual+sec+wikidata.",
+        ),
+    ] = None,
+    live: Annotated[
+        bool,
+        typer.Option(
+            "--live/--offline",
+            help="Hit real network endpoints. Off by default; tests run offline.",
+        ),
+    ] = False,
+    manual_path: Annotated[
+        Path | None,
+        typer.Option("--manual-path", help="YAML file of manual anchors."),
+    ] = None,
+    company_limit: Annotated[
+        int | None,
+        typer.Option("--limit", help="Cap the number of companies processed."),
+    ] = None,
 ) -> None:
-    """Gather current-headcount anchors from configured sources (Phase 4/7)."""
-    _not_yet_implemented(ctx, stage="collect-anchors", company_batch=company_batch, source=source)
+    """Gather current-headcount anchors from configured sources (Phase 4)."""
+    import asyncio
+
+    from sqlalchemy import select
+
+    from headcount.db.engine import session_scope
+    from headcount.db.enums import SourceName
+    from headcount.ingest.collect import collect_anchors as _collect
+    from headcount.ingest.collect import default_http_configs
+    from headcount.ingest.http import FileCache, HttpClient
+    from headcount.ingest.observers import (
+        CompanyWebObserver,
+        ManualAnchorObserver,
+        SECObserver,
+        WikidataObserver,
+    )
+    from headcount.models.company import Company
+
+    opts: GlobalOptions = ctx.obj
+    log = get_logger("headcount.cli.collect_anchors")
+
+    requested = (
+        [SourceName(name) for name in source]
+        if source
+        else [SourceName.manual, SourceName.sec, SourceName.wikidata]
+    )
+    if not live and SourceName.company_web in requested:
+        log.warning(
+            "company_web_requires_live",
+            message="company_web scraping is disabled unless --live is set",
+        )
+        requested = [s for s in requested if s is not SourceName.company_web]
+    if not live:
+        typer.echo("running in offline mode: only fixture/manual sources will execute")
+
+    adapters: list[object] = []
+    for src in requested:
+        if src is SourceName.manual:
+            adapters.append(
+                ManualAnchorObserver(path=manual_path) if manual_path else ManualAnchorObserver()
+            )
+        elif src is SourceName.sec:
+            adapters.append(SECObserver())
+        elif src is SourceName.wikidata:
+            adapters.append(WikidataObserver())
+        elif src is SourceName.company_web:
+            adapters.append(CompanyWebObserver())
+        else:
+            log.warning("unknown_source_ignored", source=src.value)
+
+    async def _run() -> dict[str, object]:
+        cache_root = opts.cache_dir if hasattr(opts, "cache_dir") else None
+        with session_scope() as session:
+            companies = list(
+                session.execute(select(Company).order_by(Company.canonical_name)).scalars()
+            )
+            if company_limit is not None:
+                companies = companies[:company_limit]
+            from headcount.config.settings import get_settings
+
+            settings = get_settings()
+            cache = FileCache(cache_root or settings.cache_dir)
+            http = HttpClient(
+                cache=cache,
+                configs=default_http_configs(),
+                transport=None if live else _offline_transport(),
+            )
+            result = await _collect(
+                session,
+                adapters=adapters,  # type: ignore[arg-type]
+                companies=companies,
+                http_client=http,
+            )
+            if opts.dry_run:
+                session.rollback()
+            return result.summary()
+
+    summary = asyncio.run(_run())
+    log.info("collect_anchors_done", batch=company_batch, **summary, dry_run=opts.dry_run)
+    typer.echo(
+        f"run={summary['run_id']} companies={summary['companies_attempted']} "
+        f"with-signals={summary['companies_with_signals']} "
+        f"signals={summary['signals_written']} anchors={summary['anchors_written']} "
+        f"errors={summary['errors']}"
+    )
+
+
+def _offline_transport() -> Any:
+    """MockTransport that always 404s, so offline runs never leak HTTP."""
+    import httpx
+
+    def _handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="offline")
+
+    return httpx.MockTransport(_handler)
 
 
 @app.command("collect-employment")

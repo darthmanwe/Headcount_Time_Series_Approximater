@@ -1,0 +1,46 @@
+{
+  "cik": 320193,
+  "entityName": "Apple Inc.",
+  "facts": {
+    "dei": {
+      "EntityNumberOfEmployees": {
+        "label": "Entity Number of Employees",
+        "description": "Number of persons employed by the Entity",
+        "units": {
+          "pure": [
+            {
+              "end": "2022-09-24",
+              "val": 164000,
+              "accn": "0000320193-22-000108",
+              "fy": 2022,
+              "fp": "FY",
+              "form": "10-K",
+              "filed": "2022-10-28",
+              "frame": "CY2022Q3I"
+            },
+            {
+              "end": "2023-09-30",
+              "val": 161000,
+              "accn": "0000320193-23-000106",
+              "fy": 2023,
+              "fp": "FY",
+              "form": "10-K",
+              "filed": "2023-11-03",
+              "frame": "CY2023Q3I"
+            },
+            {
+              "end": "2024-09-28",
+              "val": 164000,
+              "accn": "0000320193-24-000123",
+              "fy": 2024,
+              "fp": "FY",
+              "form": "10-K",
+              "filed": "2024-11-01",
+              "frame": "CY2024Q3I"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

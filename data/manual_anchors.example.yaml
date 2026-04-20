@@ -1,0 +1,15 @@
+# Example manual anchor file. See src/headcount/ingest/observers/manual.py
+# for schema notes. Analysts copy this file to `data/manual_anchors.yaml`
+# and edit in place.
+
+- canonical_name: Apple Inc.
+  domain: apple.com
+  anchor_month: 2026-04-01
+  headcount:
+    min: 160000
+    point: 164000
+    max: 168000
+    kind: range
+  confidence: 0.9
+  note: "Illustrative example; replace with cited evidence."
+  source_url: "https://example.com/press/apple-q1-2026"

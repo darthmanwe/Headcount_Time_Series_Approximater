@@ -1,0 +1,4 @@
+{
+  "head": {"vars": ["company", "companyLabel", "employees", "asof"]},
+  "results": {"bindings": []}
+}

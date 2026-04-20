@@ -1,0 +1,21 @@
+{
+  "head": {
+    "vars": ["company", "companyLabel", "employees", "asof"]
+  },
+  "results": {
+    "bindings": [
+      {
+        "company": {"type": "uri", "value": "http://www.wikidata.org/entity/Q312"},
+        "companyLabel": {"type": "literal", "value": "Apple Inc."},
+        "employees": {"type": "literal", "value": "164000"},
+        "asof": {"type": "literal", "value": "2024-09-28T00:00:00Z"}
+      },
+      {
+        "company": {"type": "uri", "value": "http://www.wikidata.org/entity/Q312"},
+        "companyLabel": {"type": "literal", "value": "Apple Inc."},
+        "employees": {"type": "literal", "value": "161000"},
+        "asof": {"type": "literal", "value": "2023-09-30T00:00:00Z"}
+      }
+    ]
+  }
+}
