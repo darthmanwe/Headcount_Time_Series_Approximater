@@ -505,13 +505,17 @@ def _main(argv: list[str]) -> int:
     _bootstrap_env(run_dir)
     _run_alembic_upgrade()
 
+    from headcount.config import get_settings
     from headcount.db.engine import session_scope
     from headcount.db.enums import PriorityTier
     from headcount.estimate.pipeline import estimate_series as run_estimate
+    from headcount.ingest.collect import default_http_configs
     from headcount.ingest.employment import collect_employment as _collect_emp
+    from headcount.ingest.http import FileCache, HttpClient
     from headcount.ingest.seeds import import_candidates, load_benchmarks
     from headcount.parsers import merge_events, promote_benchmark_events
     from headcount.resolution import resolve_candidates
+    from headcount.resolution.linkedin_resolver import backfill_linkedin_slugs
     from headcount.resolution.resolver import _backfill_benchmark_links
 
     ctx = RunContext(run_dir=run_dir, mode=args.mode)
@@ -588,6 +592,46 @@ def _main(argv: list[str]) -> int:
             "elapsed_ms": int((time.time() - t0) * 1000),
         }
         company_ids = [c.id for c in companies]
+
+        # --- Stage 4.5: LinkedIn slug backfill (BUG-A) ---
+        # Seed workbook has no LinkedIn column, so the public observer
+        # would silently no-op. Infer the slug from domain/name and
+        # verify via a logged-out /company/<slug>/ probe.
+        t0 = time.time()
+        if args.mode in {"live-safe", "live-full"}:
+            try:
+                settings = get_settings()
+                slug_http = HttpClient(
+                    cache=FileCache(settings.cache_dir),
+                    configs=default_http_configs(),
+                    transport=None,
+                )
+                slug_stats = backfill_linkedin_slugs(
+                    session, company_ids=company_ids, http=slug_http
+                )
+                summary["stages"]["linkedin_slug_backfill"] = {
+                    **slug_stats,
+                    "elapsed_ms": int((time.time() - t0) * 1000),
+                }
+            except Exception as exc:
+                ctx.add(
+                    stage="linkedin_slug_backfill",
+                    severity="warn",
+                    message="LinkedIn slug backfill failed",
+                    detail={
+                        "error": str(exc),
+                        "traceback": traceback.format_exc(limit=5),
+                    },
+                )
+                summary["stages"]["linkedin_slug_backfill"] = {
+                    "status": "error",
+                    "error": str(exc),
+                    "elapsed_ms": int((time.time() - t0) * 1000),
+                }
+        else:
+            summary["stages"]["linkedin_slug_backfill"] = {
+                "status": "skipped_offline_mode",
+            }
 
         # --- Stage 5: collect anchors (live, scoped) ---
         t0 = time.time()

@@ -94,6 +94,13 @@ class LinkedInPublicObserver(AnchorSourceAdapter):
     ) -> list[RawAnchorSignal]:
         slug = _resolve_slug(target)
         if not slug:
+            _log.info(
+                "linkedin_public_skipped",
+                reason="no_linkedin_slug",
+                company_id=target.company_id,
+                canonical_name=target.canonical_name,
+                canonical_domain=target.canonical_domain,
+            )
             return []
 
         anchor_month = self._anchor_month or month_floor(date.today())
