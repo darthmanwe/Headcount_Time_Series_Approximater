@@ -176,9 +176,63 @@ def canonicalize(
     company_batch: Annotated[
         str, typer.Option("--company-batch", help="Batch name or tag to resolve.")
     ] = "priority",
+    priority_tier: Annotated[
+        str,
+        typer.Option("--priority-tier", help="Default priority tier for new companies."),
+    ] = "P1",
+    all_candidates: Annotated[
+        bool,
+        typer.Option(
+            "--all/--pending",
+            help="Re-run resolution across every candidate instead of pending rows only.",
+        ),
+    ] = False,
 ) -> None:
     """Resolve canonical companies for a batch (Phase 3)."""
-    _not_yet_implemented(ctx, stage="canonicalize", company_batch=company_batch)
+    from headcount.db.engine import session_scope
+    from headcount.db.enums import PriorityTier
+    from headcount.resolution import resolve_candidates
+
+    try:
+        tier = PriorityTier(priority_tier)
+    except ValueError as exc:
+        raise typer.BadParameter(f"unknown priority tier {priority_tier!r}") from exc
+
+    opts: GlobalOptions = ctx.obj
+    log = get_logger("headcount.cli.canonicalize")
+    with session_scope() as session:
+        result = resolve_candidates(
+            session,
+            default_priority_tier=tier,
+            only_pending=not all_candidates,
+        )
+        if opts.dry_run:
+            session.rollback()
+    log.info(
+        "canonicalize_done",
+        batch=company_batch,
+        scanned=result.candidates_scanned,
+        resolved=result.candidates_resolved,
+        already_resolved=result.candidates_already_resolved,
+        failed=result.candidates_failed,
+        companies_created=result.companies_created,
+        aliases_created=result.aliases_created,
+        source_links_created=result.source_links_created,
+        relations_created=result.relations_created,
+        unresolved_acquirers=len(result.unresolved_acquirers),
+        unresolved_renames=len(result.unresolved_renames),
+        dry_run=opts.dry_run,
+    )
+    typer.echo(
+        f"resolved {result.candidates_resolved} candidates "
+        f"({result.companies_created} new companies, "
+        f"{result.aliases_created} aliases, "
+        f"{result.source_links_created} source links, "
+        f"{result.relations_created} relations); "
+        f"{result.candidates_failed} failed; "
+        f"{len(result.unresolved_acquirers)} unresolved acquirers, "
+        f"{len(result.unresolved_renames)} unresolved renames"
+    )
 
 
 @app.command("collect-anchors")

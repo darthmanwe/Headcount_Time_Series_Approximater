@@ -71,7 +71,7 @@ def test_cli_version_command() -> None:
 
 def test_cli_stub_returns_exit_code_two() -> None:
     runner = CliRunner()
-    result = runner.invoke(cli_app, ["canonicalize", "--company-batch", "smoke"])
+    result = runner.invoke(cli_app, ["estimate-series", "--company-batch", "smoke"])
     assert result.exit_code == 2
 
 
