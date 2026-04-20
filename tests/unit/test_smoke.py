@@ -58,6 +58,7 @@ def test_cli_help_lists_all_stage_commands() -> None:
         "compare-benchmark",
         "rerun-company",
         "status",
+        "serve",
         "version",
         "config",
     ):

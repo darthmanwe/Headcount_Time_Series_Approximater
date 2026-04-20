@@ -73,6 +73,7 @@ ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["B008", "SIM117"]
+"src/headcount/serving/api.py" = ["B008"]
 
 [tool.mypy]
 python_version = "3.12"

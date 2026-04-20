@@ -801,38 +801,270 @@ def review_queue_cmd(
 @app.command("export-growth")
 def export_growth(
     ctx: typer.Context,
-    company_batch: Annotated[str, typer.Option("--company-batch")] = "priority",
-    fmt: Annotated[str, typer.Option("--format", "-f")] = "csv",
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="Destination file path."),
+    ],
+    table: Annotated[
+        str,
+        typer.Option(
+            "--table",
+            help="One of: monthly_series, anchors, review_queue.",
+        ),
+    ] = "monthly_series",
+    fmt: Annotated[
+        str,
+        typer.Option("--format", "-f", help="csv | json | parquet"),
+    ] = "csv",
+    company_id: Annotated[
+        list[str] | None,
+        typer.Option("--company-id", help="Restrict to one or more company IDs."),
+    ] = None,
+    include_resolved: Annotated[
+        bool,
+        typer.Option(
+            "--include-resolved/--open-only",
+            help="(review_queue only) include resolved/dismissed rows.",
+        ),
+    ] = False,
 ) -> None:
-    """Export the growth table as CSV or parquet (Phase 9)."""
-    _not_yet_implemented(ctx, stage="export-growth", company_batch=company_batch, fmt=fmt)
+    """Export one of the analyst tables as CSV / JSON / Parquet (Phase 9)."""
+
+    from headcount.db.engine import session_scope
+    from headcount.serving.exports import ExportFormatError, export_table
+
+    opts: GlobalOptions = ctx.obj
+    log = get_logger("headcount.cli.export_growth")
+
+    try:
+        with session_scope() as session:
+            result = export_table(
+                session,
+                table=table,
+                path=output,
+                fmt=fmt,
+                company_ids=list(company_id) if company_id else None,
+                include_resolved=include_resolved,
+            )
+            if opts.dry_run:
+                session.rollback()
+    except ExportFormatError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    log.info(
+        "export_done",
+        table=table,
+        fmt=result.fmt,
+        rows=result.rows,
+        path=str(result.path),
+        dry_run=opts.dry_run,
+    )
+    typer.echo(f"exported {result.rows} rows table={table} fmt={result.fmt} -> {result.path}")
 
 
 @app.command("compare-benchmark")
 def compare_benchmark(
     ctx: typer.Context,
-    company_batch: Annotated[str, typer.Option("--company-batch")] = "priority",
+    company_id: Annotated[
+        list[str] | None,
+        typer.Option("--company-id", help="Restrict to one or more company IDs."),
+    ] = None,
+    threshold: Annotated[
+        float,
+        typer.Option(
+            "--threshold",
+            help="Relative-gap threshold over which a benchmark disagrees (0..1).",
+        ),
+    ] = 0.25,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Optional JSON dump of the summary."),
+    ] = None,
 ) -> None:
-    """Compare system outputs vs ``test_source/`` benchmark providers (Phase 9)."""
-    _not_yet_implemented(ctx, stage="compare-benchmark", company_batch=company_batch)
+    """Compare latest estimates against benchmark observations (Phase 9)."""
+
+    import json as _json
+
+    from headcount.db.engine import session_scope
+    from headcount.serving.benchmark_comparison import compare_estimates_to_benchmarks
+
+    opts: GlobalOptions = ctx.obj
+    log = get_logger("headcount.cli.compare_benchmark")
+
+    with session_scope() as session:
+        summary = compare_estimates_to_benchmarks(
+            session,
+            company_ids=list(company_id) if company_id else None,
+            threshold=threshold,
+        )
+        if opts.dry_run:
+            session.rollback()
+
+    payload = summary.to_dict()
+
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(_json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+    log.info(
+        "compare_benchmark_done",
+        companies=summary.companies_total,
+        with_benchmarks=summary.companies_with_benchmarks,
+        benchmarks=summary.benchmarks_total,
+        matched=summary.benchmarks_matched,
+        disagreements=summary.disagreements_total,
+        threshold=threshold,
+        dry_run=opts.dry_run,
+    )
+    typer.echo(
+        f"compare-benchmark companies={summary.companies_total} "
+        f"with_benchmarks={summary.companies_with_benchmarks} "
+        f"benchmarks={summary.benchmarks_total} matched={summary.benchmarks_matched} "
+        f"disagreements={summary.disagreements_total} threshold={threshold:.2f}"
+    )
 
 
 @app.command("rerun-company")
 def rerun_company(
     ctx: typer.Context,
     company_id: Annotated[str, typer.Option("--company-id")],
+    start_month: Annotated[str, typer.Option("--start")] = "2020-01",
+    end_month: Annotated[str | None, typer.Option("--end")] = None,
+    as_of_month: Annotated[str | None, typer.Option("--as-of")] = None,
+    sample_floor: Annotated[int, typer.Option("--sample-floor")] = 5,
 ) -> None:
-    """Re-run the full pipeline for a single company (Phase 7/9)."""
-    _not_yet_implemented(ctx, stage="rerun-company", company_id=company_id)
+    """Re-run the estimation pipeline for a single company (Phase 9)."""
+
+    from datetime import date
+
+    from headcount.db.engine import session_scope
+    from headcount.estimate.pipeline import estimate_series as run_estimate
+
+    def _parse_month(raw: str) -> date:
+        raw = raw.strip()
+        if len(raw) == 7:
+            raw = f"{raw}-01"
+        try:
+            return date.fromisoformat(raw).replace(day=1)
+        except ValueError as exc:
+            raise typer.BadParameter(f"expected YYYY-MM or YYYY-MM-DD, got {raw!r}") from exc
+
+    opts: GlobalOptions = ctx.obj
+    log = get_logger("headcount.cli.rerun_company")
+    start = _parse_month(start_month)
+    end = _parse_month(end_month) if end_month else None
+    as_of = _parse_month(as_of_month) if as_of_month else None
+
+    with session_scope() as session:
+        result = run_estimate(
+            session,
+            start_month=start,
+            end_month=end,
+            as_of_month=as_of,
+            company_ids=[company_id],
+            sample_floor=sample_floor,
+            note=f"rerun-company={company_id}",
+        )
+        if opts.dry_run:
+            session.rollback()
+
+    log.info(
+        "rerun_company_done",
+        run_id=result.run_id,
+        company_id=company_id,
+        companies_succeeded=result.companies_succeeded,
+        companies_failed=result.companies_failed,
+        months_written=result.months_written,
+        final_status=result.final_status.value,
+        dry_run=opts.dry_run,
+    )
+    typer.echo(
+        f"rerun run={result.run_id} company={company_id} "
+        f"status={result.final_status.value} months={result.months_written} "
+        f"flagged={result.months_flagged}"
+    )
 
 
 @app.command("status")
 def status(
     ctx: typer.Context,
-    run_id: Annotated[str | None, typer.Option("--run-id")] = None,
+    run_id: Annotated[
+        str | None,
+        typer.Option("--run-id", help="Run to inspect; defaults to the latest."),
+    ] = None,
 ) -> None:
     """Show aggregated ``company_run_status`` for a run (Phase 9)."""
-    _not_yet_implemented(ctx, stage="status", run_id=run_id)
+
+    from sqlalchemy import select
+
+    from headcount.db.engine import session_scope
+    from headcount.models.run import CompanyRunStatus, Run
+
+    _ = ctx
+    log = get_logger("headcount.cli.status")
+
+    with session_scope() as session:
+        if run_id is None:
+            run = session.execute(
+                select(Run).order_by(Run.started_at.desc()).limit(1)
+            ).scalar_one_or_none()
+        else:
+            run = session.get(Run, run_id)
+        if run is None:
+            typer.echo("no runs found")
+            raise typer.Exit(code=1)
+        rows = session.execute(
+            select(CompanyRunStatus).where(CompanyRunStatus.run_id == run.id)
+        ).scalars().all()
+        per_stage: dict[tuple[str, str], int] = {}
+        for r in rows:
+            key = (r.stage.value, r.status.value)
+            per_stage[key] = per_stage.get(key, 0) + 1
+
+    log.info(
+        "run_status",
+        run_id=run.id,
+        status=run.status.value,
+        kind=run.kind.value,
+        cutoff_month=run.cutoff_month.isoformat(),
+        stage_rows=len(rows),
+    )
+    typer.echo(
+        f"run={run.id} kind={run.kind.value} status={run.status.value} "
+        f"cutoff={run.cutoff_month.isoformat()} stages={len(per_stage)}"
+    )
+    if not per_stage:
+        typer.echo("  (no company-stage rows)")
+        return
+    for (stage, stat), count in sorted(per_stage.items()):
+        typer.echo(f"  {stage:22s} {stat:10s} {count}")
+
+
+@app.command("serve")
+def serve_cmd(
+    ctx: typer.Context,
+    host: Annotated[str, typer.Option("--host", help="Bind host.")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", help="Bind port.")] = 8000,
+    reload: Annotated[
+        bool,
+        typer.Option(
+            "--reload/--no-reload", help="Enable uvicorn autoreload (dev only)."
+        ),
+    ] = False,
+) -> None:
+    """Start the FastAPI server (``uvicorn apps.api.main:app``, Phase 9)."""
+
+    import uvicorn
+
+    _ = ctx
+    log = get_logger("headcount.cli.serve")
+    log.info("api_server_starting", host=host, port=port, reload=reload)
+    uvicorn.run(
+        "apps.api.main:app",
+        host=host,
+        port=port,
+        reload=reload,
+    )
 
 
 @app.command("version")
