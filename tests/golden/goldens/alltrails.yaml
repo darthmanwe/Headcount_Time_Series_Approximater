@@ -1,0 +1,38 @@
+company:
+  canonical_name: AllTrails
+  source_row:
+    workbook: "Sample Employee Growth for High Priority Prospects.xlsx"
+    sheet: "Zeeshan April 1"
+    row_index: 10
+accepted_anchor:
+  month: 2026-04-01
+  value_point: 350.5
+  value_min: 201.0
+  value_max: 500.0
+  provider: zeeshan
+  source:
+    workbook: "Sample Employee Growth for High Priority Prospects.xlsx"
+    sheet: "Zeeshan April 1"
+    row_index: 10
+monthly_samples:
+  - month: 2024-04-01
+    value_point: 318.0
+    tolerance_pct: 5.0
+    provider: zeeshan
+  - month: 2025-04-01
+    value_point: 333.0
+    tolerance_pct: 5.0
+    provider: zeeshan
+  - month: 2025-10-01
+    value_point: 341.0
+    tolerance_pct: 5.0
+    provider: zeeshan
+  - month: 2026-04-01
+    value_point: 350.5
+    tolerance_pct: 5.0
+    provider: zeeshan
+growth_windows:
+  6m: {pct: 2.6, tolerance: 1.5, provider: zeeshan}
+  1y: {pct: 5.1, tolerance: 1.5, provider: zeeshan}
+  2y: {pct: 10.1, tolerance: 1.5, provider: zeeshan}
+expected_confidence_band_latest: medium

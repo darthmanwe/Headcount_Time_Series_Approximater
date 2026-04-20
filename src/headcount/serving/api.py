@@ -705,6 +705,107 @@ def create_app(session_factory: Any | None = None) -> FastAPI:
             "latest_run": latest_run_out,
         }
 
+    @app.get("/eval/latest", tags=["eval"])
+    def eval_latest(session: Session = Depends(get_session)) -> dict[str, Any]:
+        """Return the most recent ``evaluation_run`` scoreboard.
+
+        Phase 11 regression harness. Emits the full scoreboard JSON
+        plus the promoted headline metrics so dashboards can render
+        tiles without re-parsing.
+        """
+
+        from headcount.models.evaluation_run import EvaluationRun
+
+        row = session.execute(
+            select(EvaluationRun).order_by(EvaluationRun.created_at.desc()).limit(1)
+        ).scalar_one_or_none()
+        if row is None:
+            raise HTTPException(status_code=404, detail="no evaluation runs yet")
+        return {
+            "id": row.id,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "as_of_month": row.as_of_month.isoformat(),
+            "evaluation_version": row.evaluation_version,
+            "companies_in_scope": row.companies_in_scope,
+            "companies_evaluated": row.companies_evaluated,
+            "companies_with_benchmark": row.companies_with_benchmark,
+            "coverage_in_scope": row.coverage_in_scope,
+            "coverage_with_benchmark": row.coverage_with_benchmark,
+            "mape_headcount_current": row.mape_headcount_current,
+            "mae_growth_1y_pct": row.mae_growth_1y_pct,
+            "review_queue_open": row.review_queue_open,
+            "high_confidence_disagreements": row.high_confidence_disagreements,
+            "scoreboard": row.scoreboard_json,
+            "note": row.note,
+        }
+
+    @app.get("/eval/history", tags=["eval"])
+    def eval_history(
+        session: Session = Depends(get_session),
+        limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    ) -> list[dict[str, Any]]:
+        """Return up to ``limit`` recent ``evaluation_run`` rows (newest first).
+
+        Only the promoted summary columns are returned; callers that
+        need the full scoreboard should hit ``/eval/{id}``.
+        """
+
+        from headcount.models.evaluation_run import EvaluationRun
+
+        rows = session.execute(
+            select(EvaluationRun)
+            .order_by(EvaluationRun.created_at.desc())
+            .limit(limit)
+        ).scalars()
+        return [
+            {
+                "id": r.id,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "as_of_month": r.as_of_month.isoformat(),
+                "evaluation_version": r.evaluation_version,
+                "companies_in_scope": r.companies_in_scope,
+                "companies_evaluated": r.companies_evaluated,
+                "companies_with_benchmark": r.companies_with_benchmark,
+                "coverage_in_scope": r.coverage_in_scope,
+                "coverage_with_benchmark": r.coverage_with_benchmark,
+                "mape_headcount_current": r.mape_headcount_current,
+                "mae_growth_1y_pct": r.mae_growth_1y_pct,
+                "review_queue_open": r.review_queue_open,
+                "high_confidence_disagreements": r.high_confidence_disagreements,
+                "note": r.note,
+            }
+            for r in rows
+        ]
+
+    @app.get("/eval/{evaluation_id}", tags=["eval"])
+    def eval_detail(
+        evaluation_id: str, session: Session = Depends(get_session)
+    ) -> dict[str, Any]:
+        from headcount.models.evaluation_run import EvaluationRun
+
+        row = session.get(EvaluationRun, evaluation_id)
+        if row is None:
+            raise HTTPException(
+                status_code=404, detail=f"evaluation_run not found: {evaluation_id}"
+            )
+        return {
+            "id": row.id,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "as_of_month": row.as_of_month.isoformat(),
+            "evaluation_version": row.evaluation_version,
+            "companies_in_scope": row.companies_in_scope,
+            "companies_evaluated": row.companies_evaluated,
+            "companies_with_benchmark": row.companies_with_benchmark,
+            "coverage_in_scope": row.coverage_in_scope,
+            "coverage_with_benchmark": row.coverage_with_benchmark,
+            "mape_headcount_current": row.mape_headcount_current,
+            "mae_growth_1y_pct": row.mae_growth_1y_pct,
+            "review_queue_open": row.review_queue_open,
+            "high_confidence_disagreements": row.high_confidence_disagreements,
+            "scoreboard": row.scoreboard_json,
+            "note": row.note,
+        }
+
     log.info(
         "api_ready",
         version=__version__,

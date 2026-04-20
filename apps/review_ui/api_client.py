@@ -172,6 +172,15 @@ class HeadcountApiClient:
     def status_summary(self) -> dict[str, Any]:
         return dict(self._request("GET", "/status/summary"))
 
+    def eval_latest(self) -> dict[str, Any]:
+        return dict(self._request("GET", "/eval/latest"))
+
+    def eval_history(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        return list(self._request("GET", "/eval/history", params={"limit": limit}))
+
+    def eval_detail(self, evaluation_id: str) -> dict[str, Any]:
+        return dict(self._request("GET", f"/eval/{evaluation_id}"))
+
     # ----- review queue --------------------------------------------------
 
     def list_review_queue(

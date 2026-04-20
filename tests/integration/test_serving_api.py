@@ -374,3 +374,80 @@ def test_status_summary(client: TestClient, session_factory: sessionmaker[Sessio
 
 def _iso(dt: datetime) -> str:
     return dt.astimezone(UTC).isoformat()
+
+
+def test_eval_latest_empty_returns_404(client: TestClient) -> None:
+    resp = client.get("/eval/latest")
+    assert resp.status_code == 404
+
+
+def test_eval_latest_returns_scoreboard(
+    client: TestClient, session_factory: sessionmaker[Session]
+) -> None:
+    from headcount.review.evaluation import (
+        evaluate_against_benchmarks,
+        persist_scoreboard,
+    )
+
+    with session_factory() as session:
+        company = _seed(session)
+        session.add(
+            BenchmarkObservation(
+                company_id=company.id,
+                source_workbook="t.xlsx",
+                source_sheet="S",
+                source_row_index=1,
+                company_name_raw=company.canonical_name,
+                provider=BenchmarkProvider.zeeshan,
+                metric=BenchmarkMetric.headcount_current,
+                as_of_month=date(2023, 12, 1),
+                value_point=9.0,
+            )
+        )
+        session.commit()
+        board = evaluate_against_benchmarks(
+            session, as_of_month=date(2023, 12, 1)
+        )
+        eval_id = persist_scoreboard(session, board, note="api-test")
+        session.commit()
+
+    body = client.get("/eval/latest").json()
+    assert body["id"] == eval_id
+    assert body["companies_evaluated"] == 1
+    assert body["scoreboard"]["companies"]["evaluated"] == 1
+    assert body["note"] == "api-test"
+
+
+def test_eval_history_and_detail(
+    client: TestClient, session_factory: sessionmaker[Session]
+) -> None:
+    from headcount.review.evaluation import (
+        evaluate_against_benchmarks,
+        persist_scoreboard,
+    )
+
+    with session_factory() as session:
+        _seed(session)
+        session.commit()
+        board = evaluate_against_benchmarks(
+            session, as_of_month=date(2023, 12, 1)
+        )
+        eval_id = persist_scoreboard(session, board, note="first")
+        session.commit()
+        # Second snapshot to confirm ordering.
+        board2 = evaluate_against_benchmarks(
+            session, as_of_month=date(2023, 12, 1)
+        )
+        eval_id2 = persist_scoreboard(session, board2, note="second")
+        session.commit()
+
+    history = client.get("/eval/history", params={"limit": 10}).json()
+    assert [r["note"] for r in history[:2]] == ["second", "first"]
+
+    detail = client.get(f"/eval/{eval_id}").json()
+    assert detail["id"] == eval_id
+    assert detail["note"] == "first"
+    assert "scoreboard" in detail
+
+    missing = client.get(f"/eval/{eval_id2[::-1]}")
+    assert missing.status_code == 404

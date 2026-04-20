@@ -1,0 +1,38 @@
+company:
+  canonical_name: 6sense
+  source_row:
+    workbook: "Sample Employee Growth for High Priority Prospects.xlsx"
+    sheet: "Zeeshan April 1"
+    row_index: 5
+accepted_anchor:
+  month: 2026-04-01
+  value_point: 3000.0
+  value_min: 1001.0
+  value_max: 5000.0
+  provider: zeeshan
+  source:
+    workbook: "Sample Employee Growth for High Priority Prospects.xlsx"
+    sheet: "Zeeshan April 1"
+    row_index: 5
+monthly_samples:
+  - month: 2024-04-01
+    value_point: 3261.0
+    tolerance_pct: 5.0
+    provider: zeeshan
+  - month: 2025-04-01
+    value_point: 3125.0
+    tolerance_pct: 5.0
+    provider: zeeshan
+  - month: 2025-10-01
+    value_point: 3061.0
+    tolerance_pct: 5.0
+    provider: zeeshan
+  - month: 2026-04-01
+    value_point: 3000.0
+    tolerance_pct: 5.0
+    provider: zeeshan
+growth_windows:
+  6m: {pct: -2.0, tolerance: 2.0, provider: zeeshan}
+  1y: {pct: -4.0, tolerance: 2.0, provider: zeeshan}
+  2y: {pct: -8.0, tolerance: 2.0, provider: zeeshan}
+expected_confidence_band_latest: medium

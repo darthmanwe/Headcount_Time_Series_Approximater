@@ -1,0 +1,39 @@
+company:
+  canonical_name: "Alloy Therapeutics, Inc."
+  source_row:
+    workbook: "Sample Employee Growth for High Priority Prospects.xlsx"
+    sheet: "Zeeshan April 1"
+    row_index: 9
+accepted_anchor:
+  month: 2026-04-01
+  value_point: 125.0
+  value_min: 51.0
+  value_max: 200.0
+  provider: zeeshan
+  source:
+    workbook: "Sample Employee Growth for High Priority Prospects.xlsx"
+    sheet: "Zeeshan April 1"
+    row_index: 9
+monthly_samples:
+  - month: 2024-04-01
+    value_point: 66.0
+    tolerance_pct: 7.0
+    provider: zeeshan
+  - month: 2025-04-01
+    value_point: 87.0
+    tolerance_pct: 7.0
+    provider: zeeshan
+  - month: 2025-10-01
+    value_point: 102.0
+    tolerance_pct: 7.0
+    provider: zeeshan
+  - month: 2026-04-01
+    value_point: 125.0
+    tolerance_pct: 7.0
+    provider: zeeshan
+growth_windows:
+  6m: {pct: 22.5, tolerance: 3.0, provider: zeeshan}
+  1y: {pct: 43.7, tolerance: 3.0, provider: zeeshan}
+  2y: {pct: 89.4, tolerance: 4.0, provider: zeeshan}
+expected_confidence_band_latest: medium
+notes: "Hypergrowth profile; growth tolerances slightly wider."

@@ -53,6 +53,22 @@ from headcount.review.benchmark_disagreement import (
     BenchmarkDisagreement,
     detect_benchmark_disagreement,
 )
+from headcount.review.evaluation import (
+    EVALUATION_VERSION,
+    Disagreement,
+    EvaluationConfig,
+    Scoreboard,
+    evaluate_against_benchmarks,
+    persist_scoreboard,
+)
+from headcount.review.golden import (
+    GOLDEN_VERSION,
+    GoldenFixture,
+    GoldenMismatch,
+    GoldenReport,
+    load_goldens_dir,
+    run_goldens,
+)
 from headcount.review.overrides import (
     OVERRIDES_VERSION,
     ActiveOverrides,
@@ -73,6 +89,8 @@ from headcount.review.scoring import (
 __all__ = [
     "AUDIT_VERSION",
     "BENCHMARK_DISAGREEMENT_VERSION",
+    "EVALUATION_VERSION",
+    "GOLDEN_VERSION",
     "OVERRIDES_VERSION",
     "QUEUE_VERSION",
     "SCORING_VERSION",
@@ -80,10 +98,20 @@ __all__ = [
     "BenchmarkDisagreement",
     "ConfidenceBreakdown",
     "ConfidenceInputs",
+    "Disagreement",
+    "EvaluationConfig",
+    "GoldenFixture",
+    "GoldenMismatch",
+    "GoldenReport",
     "QueueCandidate",
+    "Scoreboard",
     "detect_benchmark_disagreement",
+    "evaluate_against_benchmarks",
     "load_active_overrides",
+    "load_goldens_dir",
+    "persist_scoreboard",
     "record_audit",
+    "run_goldens",
     "score_confidence",
     "upsert_review_items",
 ]

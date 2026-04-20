@@ -1,0 +1,38 @@
+company:
+  canonical_name: Alleva
+  source_row:
+    workbook: "Sample Employee Growth for High Priority Prospects.xlsx"
+    sheet: "Zeeshan April 1"
+    row_index: 7
+accepted_anchor:
+  month: 2026-04-01
+  value_point: 125.0
+  value_min: 51.0
+  value_max: 200.0
+  provider: zeeshan
+  source:
+    workbook: "Sample Employee Growth for High Priority Prospects.xlsx"
+    sheet: "Zeeshan April 1"
+    row_index: 7
+monthly_samples:
+  - month: 2024-04-01
+    value_point: 149.0
+    tolerance_pct: 5.0
+    provider: zeeshan
+  - month: 2025-04-01
+    value_point: 136.0
+    tolerance_pct: 5.0
+    provider: zeeshan
+  - month: 2025-10-01
+    value_point: 130.0
+    tolerance_pct: 5.0
+    provider: zeeshan
+  - month: 2026-04-01
+    value_point: 125.0
+    tolerance_pct: 5.0
+    provider: zeeshan
+growth_windows:
+  6m: {pct: -3.8, tolerance: 2.0, provider: zeeshan}
+  1y: {pct: -8.1, tolerance: 2.0, provider: zeeshan}
+  2y: {pct: -16.1, tolerance: 2.0, provider: zeeshan}
+expected_confidence_band_latest: medium

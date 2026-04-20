@@ -20,6 +20,7 @@ from headcount.models.company_relation import CompanyRelation
 from headcount.models.company_source_link import CompanySourceLink
 from headcount.models.confidence_component_score import ConfidenceComponentScore
 from headcount.models.estimate_version import EstimateVersion
+from headcount.models.evaluation_run import EvaluationRun
 from headcount.models.headcount_estimate_monthly import HeadcountEstimateMonthly
 from headcount.models.manual_override import ManualOverride
 from headcount.models.person import Person
@@ -46,6 +47,7 @@ __all__ = [
     "CompanySourceLink",
     "ConfidenceComponentScore",
     "EstimateVersion",
+    "EvaluationRun",
     "HeadcountEstimateMonthly",
     "ManualOverride",
     "Person",

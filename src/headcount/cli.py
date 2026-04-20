@@ -1023,6 +1023,152 @@ def compare_benchmark(
     )
 
 
+@app.command("evaluate")
+def evaluate_cmd(
+    ctx: typer.Context,
+    as_of_month: Annotated[
+        str | None,
+        typer.Option(
+            "--as-of-month",
+            help="Reference month for translating 6m/1y/2y anchors (YYYY-MM). "
+            "Defaults to the first of the current month.",
+        ),
+    ] = None,
+    company_id: Annotated[
+        list[str] | None,
+        typer.Option("--company-id", help="Restrict scope to one or more company IDs."),
+    ] = None,
+    persist: Annotated[
+        bool,
+        typer.Option(
+            "--persist/--no-persist",
+            help="Write the scoreboard to ``evaluation_run`` (default: persist).",
+        ),
+    ] = True,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Optional JSON path to dump the scoreboard.",
+        ),
+    ] = None,
+    top_disagreements: Annotated[
+        int,
+        typer.Option(
+            "--top-disagreements",
+            help="Max number of top disagreements to include.",
+        ),
+    ] = 25,
+    high_confidence_ratio: Annotated[
+        float,
+        typer.Option(
+            "--high-confidence-ratio",
+            help=(
+                "Relative-gap threshold above which a high/medium band row "
+                "counts as a 'high-confidence disagreement' (1.0 = 2x gap)."
+            ),
+        ),
+    ] = 1.0,
+    note: Annotated[
+        str | None,
+        typer.Option("--note", help="Free-text note attached to the evaluation_run row."),
+    ] = None,
+) -> None:
+    """Run the Phase 11 evaluation harness against the current DB state.
+
+    Joins the latest :class:`HeadcountEstimateMonthly` rows with every
+    :class:`BenchmarkObservation` that resolves to a known company and
+    emits a scoreboard covering coverage, per-provider accuracy,
+    growth-window error, review-queue state, and top disagreements.
+
+    The full scoreboard is persisted to ``evaluation_run`` by default
+    and can additionally be dumped to JSON via ``--output``.
+    """
+
+    import json as _json
+    from datetime import UTC, date, datetime
+
+    from headcount.db.engine import session_scope
+    from headcount.review.evaluation import (
+        EvaluationConfig,
+        evaluate_against_benchmarks,
+        persist_scoreboard,
+    )
+
+    opts: GlobalOptions = ctx.obj
+    log = get_logger("headcount.cli.evaluate")
+
+    if as_of_month:
+        as_of = date.fromisoformat(
+            as_of_month if len(as_of_month) > 7 else f"{as_of_month}-01"
+        ).replace(day=1)
+    else:
+        today = date.today()
+        as_of = today.replace(day=1)
+
+    config = EvaluationConfig(
+        top_disagreements_limit=top_disagreements,
+        high_confidence_disagreement_ratio=high_confidence_ratio,
+    )
+
+    with session_scope() as session:
+        scoreboard = evaluate_against_benchmarks(
+            session,
+            as_of_month=as_of,
+            config=config,
+            company_ids=list(company_id) if company_id else None,
+            evaluated_at=datetime.now(tz=UTC),
+        )
+        evaluation_id: str | None = None
+        if persist and not opts.dry_run:
+            evaluation_id = persist_scoreboard(session, scoreboard, note=note)
+        if opts.dry_run:
+            session.rollback()
+
+    payload = scoreboard.to_dict()
+    payload["evaluation_run_id"] = evaluation_id
+
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(
+            _json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
+        )
+
+    headline_mape = scoreboard.headline_mape()
+    headline_mae = scoreboard.headline_growth_mae()
+    log.info(
+        "evaluate_done",
+        evaluation_run_id=evaluation_id,
+        as_of=as_of.isoformat(),
+        companies_in_scope=scoreboard.companies_in_scope,
+        companies_evaluated=scoreboard.companies_evaluated,
+        headline_mape=headline_mape,
+        headline_growth_mae_1y=headline_mae,
+        hc_disagreements=scoreboard.high_confidence_disagreements,
+        dry_run=opts.dry_run,
+    )
+    typer.echo(
+        " ".join(
+            [
+                "evaluate",
+                f"as_of={as_of.isoformat()}",
+                f"companies={scoreboard.companies_evaluated}/{scoreboard.companies_in_scope}",
+                f"with_benchmark={scoreboard.companies_with_benchmark}",
+                f"coverage_in_scope={scoreboard.coverage_in_scope:.2%}",
+                f"mape_current={_fmt_metric(headline_mape)}",
+                f"mae_growth_1y={_fmt_metric(headline_mae)}",
+                f"hc_disagreements={scoreboard.high_confidence_disagreements}",
+                f"run={evaluation_id or '-'}",
+            ]
+        )
+    )
+
+
+def _fmt_metric(value: float | None) -> str:
+    return f"{value:.4f}" if value is not None else "-"
+
+
 @app.command("rerun-company")
 def rerun_company(
     ctx: typer.Context,
