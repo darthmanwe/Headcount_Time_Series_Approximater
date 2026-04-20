@@ -38,6 +38,9 @@ from headcount.config import get_settings
 from headcount.db.enums import (
     CompanyRunStage,
     CompanyRunStageStatus,
+    ConfidenceBand,
+    EstimateMethod,
+    ReviewReason,
     RunKind,
     RunStatus,
 )
@@ -67,10 +70,21 @@ from headcount.models.anchor_reconciliation import AnchorReconciliation
 from headcount.models.company import Company
 from headcount.models.company_anchor_observation import CompanyAnchorObservation
 from headcount.models.company_event import CompanyEvent
+from headcount.models.confidence_component_score import ConfidenceComponentScore
 from headcount.models.estimate_version import EstimateVersion
 from headcount.models.headcount_estimate_monthly import HeadcountEstimateMonthly
 from headcount.models.person_employment_observation import PersonEmploymentObservation
 from headcount.models.run import CompanyRunStatus, Run
+from headcount.models.source_observation import SourceObservation
+from headcount.review.audit import record_audit
+from headcount.review.overrides import ActiveOverrides, load_active_overrides
+from headcount.review.queue import QueueCandidate, upsert_review_items
+from headcount.review.scoring import (
+    SCORING_VERSION,
+    ConfidenceBreakdown,
+    ConfidenceInputs,
+    score_confidence,
+)
 from headcount.utils.logging import get_logger
 
 log = get_logger("headcount.estimate.pipeline")
@@ -83,6 +97,9 @@ class CompanyEstimateReport:
     months_written: int = 0
     months_flagged: int = 0
     anchor_reconciliations_written: int = 0
+    review_items_inserted: int = 0
+    review_items_refreshed: int = 0
+    overrides_applied: int = 0
     stage_status: CompanyRunStageStatus = CompanyRunStageStatus.pending
     error: str | None = None
     estimate_version_id: str | None = None
@@ -97,6 +114,9 @@ class EstimateResult:
     companies_degraded: int = 0
     months_written: int = 0
     months_flagged: int = 0
+    review_items_inserted: int = 0
+    review_items_refreshed: int = 0
+    overrides_applied: int = 0
     reports: list[CompanyEstimateReport] = field(default_factory=list)
 
     @property
@@ -115,15 +135,24 @@ def _month_floor(d: date) -> date:
 
 
 def _load_anchors(session: Session, company_id: str) -> list[AnchorCandidate]:
-    rows = (
-        session.execute(
-            select(CompanyAnchorObservation)
-            .where(CompanyAnchorObservation.company_id == company_id)
-            .order_by(CompanyAnchorObservation.anchor_month)
+    """Load anchors for a company, tagged with originating source name.
+
+    The ``source_name`` travels with the candidate so the scorer can
+    count distinct source classes for
+    :func:`~headcount.review.scoring.score_confidence`'s
+    multi-source corroboration component.
+    """
+
+    rows = session.execute(
+        select(CompanyAnchorObservation, SourceObservation.source_name)
+        .join(
+            SourceObservation,
+            SourceObservation.id == CompanyAnchorObservation.source_observation_id,
+            isouter=True,
         )
-        .scalars()
-        .all()
-    )
+        .where(CompanyAnchorObservation.company_id == company_id)
+        .order_by(CompanyAnchorObservation.anchor_month)
+    ).all()
     return [
         AnchorCandidate(
             anchor_month=_month_floor(r.anchor_month),
@@ -133,9 +162,10 @@ def _load_anchors(session: Session, company_id: str) -> list[AnchorCandidate]:
             kind=r.headcount_value_kind,
             anchor_type=r.anchor_type,
             confidence=float(r.confidence or 0.0),
+            source_name=(source_name.value if source_name is not None else "manual"),
             observation_id=r.id,
         )
-        for r in rows
+        for (r, source_name) in rows
     ]
 
 
@@ -224,6 +254,81 @@ def _ensure_stage_row(session: Session, *, run_id: str, company_id: str) -> Comp
     return row
 
 
+def _apply_suppress_windows(
+    rows: list[MonthlyEstimate],
+    overrides: ActiveOverrides,
+) -> list[MonthlyEstimate]:
+    """Force-suppress any month falling inside an analyst suppress window."""
+
+    if not overrides.suppress_windows:
+        return rows
+    out: list[MonthlyEstimate] = []
+    for r in rows:
+        window = overrides.is_suppressed(r.month)
+        if window is None:
+            out.append(r)
+            continue
+        out.append(
+            MonthlyEstimate(
+                month=r.month,
+                value_min=r.value_min,
+                value_point=r.value_point,
+                value_max=r.value_max,
+                public_profile_count=r.public_profile_count,
+                scaled_from_anchor_value=r.scaled_from_anchor_value,
+                method=EstimateMethod.suppressed_low_sample,
+                confidence_band=ConfidenceBand.manual_review_required,
+                needs_review=True,
+                suppression_reason=f"manual_suppress({window.reason})"[:256],
+                coverage_factor=r.coverage_factor,
+                ratio=r.ratio,
+                anchor_month=r.anchor_month,
+                contributing_anchor_ids=r.contributing_anchor_ids,
+            )
+        )
+    return out
+
+
+def _distinct_source_classes(anchors: list[AnchorCandidate]) -> int:
+    return len({a.source_name for a in anchors if a.source_name})
+
+
+def _segment_break_months(segments: list[Segment]) -> tuple[date, ...]:
+    return tuple(s.start_month for s in segments if s is not segments[0])
+
+
+def _score_segment(
+    *,
+    segment: Segment,
+    segment_anchors: list[AnchorCandidate],
+    rows: list[MonthlyEstimate],
+    break_months: tuple[date, ...],
+    as_of_month: date,
+    coverage: CoverageCurve,
+    sample_floor: int,
+) -> dict[date, ConfidenceBreakdown]:
+    anchors_tuple = tuple(segment_anchors)
+    distinct = _distinct_source_classes(segment_anchors)
+    out: dict[date, ConfidenceBreakdown] = {}
+    for r in rows:
+        inputs = ConfidenceInputs(
+            estimate=r,
+            segment_anchors=anchors_tuple,
+            segment_break_months=break_months,
+            distinct_source_classes=distinct,
+            as_of_month=as_of_month,
+            coverage=coverage,
+            sample_floor=sample_floor,
+        )
+        out[r.month] = score_confidence(inputs)
+    # Segments with no anchors still need rows in the return dict so
+    # the persist step writes a confidence_score of 0 and forces
+    # manual_review_required. The scorer already produces exactly that
+    # shape when segment_anchors is empty; no special handling here.
+    _ = segment  # kept for future per-segment instrumentation.
+    return out
+
+
 def _persist_company_estimates(
     session: Session,
     *,
@@ -234,6 +339,7 @@ def _persist_company_estimates(
     per_segment_anchor: dict[Segment, object],
     per_segment_rows: dict[Segment, list[MonthlyEstimate]],
     per_segment_flags: dict[Segment, list[AnomalyFlags]],
+    per_segment_confidence: dict[Segment, dict[date, ConfidenceBreakdown]],
 ) -> CompanyEstimateReport:
     report = CompanyEstimateReport(company_id=company_id)
     report.segments = len(segments)
@@ -250,10 +356,15 @@ def _persist_company_estimates(
     session.flush()
     report.estimate_version_id = version.id
 
+    # Aggregate per-component averages across all months for the
+    # version-level ConfidenceComponentScore rows.
+    component_totals: dict[str, list[float]] = {}
+
     for seg in segments:
         anchor = per_segment_anchor.get(seg)
         rows = per_segment_rows.get(seg, [])
         flags = per_segment_flags.get(seg, [])
+        confidences = per_segment_confidence.get(seg, {})
         flags_by_month = {f.month: f for f in flags}
 
         if anchor is not None:
@@ -282,6 +393,20 @@ def _persist_company_estimates(
             if flags_for_month and flags_for_month.reasons and suppression is None:
                 suppression = "; ".join(flags_for_month.reasons)[:256]
 
+            breakdown = confidences.get(est.month)
+            if breakdown is not None:
+                band = breakdown.band
+                score_value: float | None = breakdown.score
+                components_json: dict[str, object] | None = breakdown.as_json()
+                for k, v in breakdown.components.items():
+                    component_totals.setdefault(k, []).append(v)
+                if band is ConfidenceBand.manual_review_required:
+                    needs_review = True
+            else:
+                band = est.confidence_band
+                score_value = None
+                components_json = None
+
             session.add(
                 HeadcountEstimateMonthly(
                     company_id=company_id,
@@ -293,16 +418,125 @@ def _persist_company_estimates(
                     public_profile_count=int(est.public_profile_count),
                     scaled_from_anchor_value=float(est.scaled_from_anchor_value),
                     method=est.method,
-                    confidence_band=est.confidence_band,
+                    confidence_band=band,
                     needs_review=needs_review,
                     suppression_reason=suppression,
+                    confidence_score=score_value,
+                    confidence_components_json=components_json,
                 )
             )
             report.months_written += 1
             if needs_review:
                 report.months_flagged += 1
 
+    # Persist the version-level component averages. This is what
+    # dashboards use to compare whole-company confidence across runs
+    # without scanning every month.
+    for name, values in component_totals.items():
+        if not values:
+            continue
+        session.add(
+            ConfidenceComponentScore(
+                estimate_version_id=version.id,
+                component_name=name,
+                component_score=sum(values) / len(values),
+                note=f"n_months={len(values)} scoring_version={SCORING_VERSION}",
+            )
+        )
+
     return report
+
+
+def _build_queue_candidates(
+    *,
+    company_id: str,
+    estimate_version_id: str,
+    segments: list[Segment],
+    per_segment_rows: dict[Segment, list[MonthlyEstimate]],
+    per_segment_flags: dict[Segment, list[AnomalyFlags]],
+    per_segment_confidence: dict[Segment, dict[date, ConfidenceBreakdown]],
+    overrides: ActiveOverrides,
+) -> list[QueueCandidate]:
+    """Derive queue rows from pipeline output.
+
+    We emit *at most one* queue row per (company, version, reason)
+    because the queue dedupes on that key.
+    """
+
+    low_confidence_months: list[tuple[date, float]] = []
+    anomaly_months: list[tuple[date, tuple[str, ...]]] = []
+    suppress_hits: list[tuple[date, str]] = []
+
+    for seg in segments:
+        rows = per_segment_rows.get(seg, [])
+        flags = per_segment_flags.get(seg, [])
+        confidences = per_segment_confidence.get(seg, {})
+        flags_by_month = {f.month: f for f in flags}
+        for r in rows:
+            fl = flags_by_month.get(r.month)
+            if fl is not None and fl.needs_review and fl.reasons:
+                anomaly_months.append((r.month, fl.reasons))
+            breakdown = confidences.get(r.month)
+            if breakdown is not None and breakdown.band in (
+                ConfidenceBand.low,
+                ConfidenceBand.manual_review_required,
+            ):
+                low_confidence_months.append((r.month, breakdown.score))
+            hit = overrides.is_suppressed(r.month)
+            if hit is not None:
+                suppress_hits.append((r.month, hit.reason))
+
+    candidates: list[QueueCandidate] = []
+
+    if low_confidence_months:
+        worst = min(score for _, score in low_confidence_months)
+        detail_months = ",".join(m.isoformat() for m, _ in sorted(low_confidence_months)[:6])
+        candidates.append(
+            QueueCandidate(
+                company_id=company_id,
+                estimate_version_id=estimate_version_id,
+                review_reason=ReviewReason.low_confidence,
+                detail=(
+                    f"{len(low_confidence_months)} months below medium "
+                    f"(min_score={worst:.2f}); months={detail_months}"
+                ),
+                severity=1.0 - worst,
+                confidence_score=worst,
+            )
+        )
+
+    if anomaly_months:
+        reason_counts: dict[str, int] = {}
+        for _, reasons in anomaly_months:
+            for rsn in reasons:
+                label = rsn.split("=")[0] if "=" in rsn else rsn
+                reason_counts[label] = reason_counts.get(label, 0) + 1
+        breakdown_text = ", ".join(
+            f"{k}:{v}" for k, v in sorted(reason_counts.items(), key=lambda kv: -kv[1])
+        )
+        candidates.append(
+            QueueCandidate(
+                company_id=company_id,
+                estimate_version_id=estimate_version_id,
+                review_reason=ReviewReason.anomaly,
+                detail=f"{len(anomaly_months)} flagged months; {breakdown_text}",
+                severity=min(1.0, len(anomaly_months) / max(1, len(segments) * 6)),
+            )
+        )
+
+    if suppress_hits:
+        detail = "; ".join(f"{m.isoformat()}:{reason}" for m, reason in suppress_hits[:6])
+        candidates.append(
+            QueueCandidate(
+                company_id=company_id,
+                estimate_version_id=estimate_version_id,
+                review_reason=ReviewReason.manual,
+                detail=f"{len(suppress_hits)} suppressed months via override; {detail}",
+                severity=0.3,
+            )
+        )
+
+    return candidates
 
 
 def estimate_company(
@@ -326,9 +560,10 @@ def estimate_company(
     stage = _ensure_stage_row(session, run_id=run_id, company_id=company.id)
 
     try:
-        anchors = _load_anchors(session, company.id)
+        overrides = load_active_overrides(session, company.id)
+        anchors = overrides.merged_into_anchors(_load_anchors(session, company.id))
         employment = _load_employment(session, company.id)
-        events = _load_events(session, company.id)
+        events = overrides.merged_into_events(_load_events(session, company.id))
 
         segments = split_into_segments(
             events,
@@ -346,9 +581,13 @@ def estimate_company(
         per_segment_anchor: dict[Segment, object] = {}
         per_segment_rows: dict[Segment, list[MonthlyEstimate]] = {}
         per_segment_flags: dict[Segment, list[AnomalyFlags]] = {}
+        per_segment_confidence: dict[Segment, dict[date, ConfidenceBreakdown]] = {}
+        per_segment_anchor_inputs: dict[Segment, list[AnchorCandidate]] = {}
+        break_months_tuple = _segment_break_months(segments)
 
         for seg in segments:
             seg_anchors = _segment_anchors(seg, anchors)
+            per_segment_anchor_inputs[seg] = seg_anchors
             reconciled = reconcile_segment_anchors(
                 seg_anchors,
                 segment_start=seg.start_month,
@@ -362,13 +601,23 @@ def estimate_company(
                 as_of_month=_month_floor(as_of_month),
                 sample_floor=sample_floor,
             )
-            break_months = {s.start_month for s in segments if s is not segments[0]}
-            flags = detect_anomalies(rows, segment_break_months=break_months)
+            rows = _apply_suppress_windows(rows, overrides)
+            flags = detect_anomalies(rows, segment_break_months=set(break_months_tuple))
+            confidences = _score_segment(
+                segment=seg,
+                segment_anchors=seg_anchors,
+                rows=rows,
+                break_months=break_months_tuple,
+                as_of_month=_month_floor(as_of_month),
+                coverage=coverage,
+                sample_floor=sample_floor,
+            )
 
             if reconciled is not None:
                 per_segment_anchor[seg] = reconciled
             per_segment_rows[seg] = rows
             per_segment_flags[seg] = flags
+            per_segment_confidence[seg] = confidences
 
         report = _persist_company_estimates(
             session,
@@ -379,7 +628,39 @@ def estimate_company(
             per_segment_anchor=per_segment_anchor,
             per_segment_rows=per_segment_rows,
             per_segment_flags=per_segment_flags,
+            per_segment_confidence=per_segment_confidence,
         )
+
+        if report.estimate_version_id is not None:
+            queue_candidates = _build_queue_candidates(
+                company_id=company.id,
+                estimate_version_id=report.estimate_version_id,
+                segments=segments,
+                per_segment_rows=per_segment_rows,
+                per_segment_flags=per_segment_flags,
+                per_segment_confidence=per_segment_confidence,
+                overrides=overrides,
+            )
+            queue_stats = upsert_review_items(session, queue_candidates)
+            report.review_items_inserted = queue_stats["inserted"]
+            report.review_items_refreshed = queue_stats["refreshed"]
+
+        if overrides.override_ids:
+            report.overrides_applied = len(overrides.override_ids)
+            record_audit(
+                session,
+                actor_type="pipeline",
+                action="overrides_applied",
+                target_type="estimate_version",
+                target_id=report.estimate_version_id,
+                payload={
+                    "company_id": company.id,
+                    "override_ids": list(overrides.override_ids),
+                    "n_pins": len(overrides.anchor_pins),
+                    "n_windows": len(overrides.suppress_windows),
+                    "n_synthetic_events": len(overrides.synthetic_events),
+                },
+            )
 
         any_degraded = any(e.needs_review for rows in per_segment_rows.values() for e in rows)
         if report.months_written == 0:
@@ -457,6 +738,9 @@ def estimate_series(
         result.reports.append(report)
         result.months_written += report.months_written
         result.months_flagged += report.months_flagged
+        result.review_items_inserted += report.review_items_inserted
+        result.review_items_refreshed += report.review_items_refreshed
+        result.overrides_applied += report.overrides_applied
         if report.stage_status == CompanyRunStageStatus.failed:
             result.companies_failed += 1
         elif report.months_flagged > 0:

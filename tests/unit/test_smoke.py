@@ -52,6 +52,8 @@ def test_cli_help_lists_all_stage_commands() -> None:
         "collect-employment",
         "estimate-series",
         "score-confidence",
+        "apply-override",
+        "review-queue",
         "export-growth",
         "compare-benchmark",
         "rerun-company",

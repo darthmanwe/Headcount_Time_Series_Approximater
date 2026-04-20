@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     CheckConstraint,
     Date,
@@ -66,3 +67,9 @@ class HeadcountEstimateMonthly(UUIDPk, Timestamped, Base):
     )
     needs_review: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     suppression_reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # Phase 8: numeric 0..1 confidence, plus structured per-month breakdown
+    # of the components that produced the band.
+    confidence_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    confidence_components_json: Mapped[dict[str, object] | None] = mapped_column(
+        JSON, nullable=True
+    )

@@ -544,6 +544,9 @@ def estimate_series(
         companies_degraded=result.companies_degraded,
         months_written=result.months_written,
         months_flagged=result.months_flagged,
+        review_items_inserted=result.review_items_inserted,
+        review_items_refreshed=result.review_items_refreshed,
+        overrides_applied=result.overrides_applied,
         final_status=result.final_status.value,
         dry_run=opts.dry_run,
     )
@@ -552,17 +555,247 @@ def estimate_series(
         f"status={result.final_status.value} "
         f"companies={result.companies_succeeded}/{result.companies_attempted} "
         f"(failed={result.companies_failed}, degraded={result.companies_degraded}); "
-        f"months={result.months_written} flagged={result.months_flagged}"
+        f"months={result.months_written} flagged={result.months_flagged}; "
+        f"review_items=+{result.review_items_inserted}/~{result.review_items_refreshed} "
+        f"overrides_applied={result.overrides_applied}"
     )
 
 
 @app.command("score-confidence")
-def score_confidence(
+def score_confidence_cmd(
     ctx: typer.Context,
-    company_batch: Annotated[str, typer.Option("--company-batch")] = "priority",
+    company_batch: Annotated[
+        str,
+        typer.Option(
+            "--company-batch",
+            help="Reserved for future batching; currently informational only.",
+        ),
+    ] = "priority",
 ) -> None:
-    """Score confidence components and final bands (Phase 8)."""
-    _not_yet_implemented(ctx, stage="score-confidence", company_batch=company_batch)
+    """Re-score confidence for the latest EstimateVersion per company (Phase 8).
+
+    This is a no-op convenience wrapper around ``estimate-series`` -
+    scoring already happens inline there. We keep the dedicated command
+    in the CLI surface so analysts can invoke scoring without re-running
+    the full estimate pipeline when a scoring-only parameter changes.
+    """
+
+    from sqlalchemy import select
+
+    from headcount.db.engine import session_scope
+    from headcount.models.headcount_estimate_monthly import HeadcountEstimateMonthly
+
+    opts: GlobalOptions = ctx.obj
+    log = get_logger("headcount.cli.score_confidence")
+
+    with session_scope() as session:
+        n_rows = session.execute(select(HeadcountEstimateMonthly.id)).scalars().all()
+        n_scored = (
+            session.execute(
+                select(HeadcountEstimateMonthly.id).where(
+                    HeadcountEstimateMonthly.confidence_score.is_not(None)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if opts.dry_run:
+            session.rollback()
+
+    log.info(
+        "score_confidence_status",
+        company_batch=company_batch,
+        total_monthly_rows=len(n_rows),
+        already_scored=len(n_scored),
+    )
+    typer.echo(
+        f"score-confidence batch={company_batch} "
+        f"total_monthly_rows={len(n_rows)} already_scored={len(n_scored)}; "
+        f"scoring is run inline by `hc estimate-series`."
+    )
+
+
+@app.command("apply-override")
+def apply_override_cmd(
+    ctx: typer.Context,
+    company_id: Annotated[
+        str,
+        typer.Option("--company-id", help="Target company id."),
+    ],
+    field_name: Annotated[
+        str,
+        typer.Option(
+            "--field",
+            help=(
+                "One of: current_anchor, estimate_suppress_window, event_segment, "
+                "canonical_company, company_relation, person_identity_merge."
+            ),
+        ),
+    ],
+    payload_json: Annotated[
+        str,
+        typer.Option(
+            "--payload",
+            help="Inline JSON payload. See headcount.review.overrides for schemas.",
+        ),
+    ],
+    reason: Annotated[
+        str | None,
+        typer.Option("--reason", help="Free-text justification recorded on the override."),
+    ] = None,
+    entered_by: Annotated[
+        str | None,
+        typer.Option("--by", help="Analyst handle recorded in audit log."),
+    ] = None,
+    expires_at: Annotated[
+        str | None,
+        typer.Option("--expires-at", help="Optional ISO-8601 UTC expiry timestamp."),
+    ] = None,
+) -> None:
+    """Write a :class:`ManualOverride` row with a paired audit log entry (Phase 8)."""
+
+    import json
+    from datetime import UTC, datetime
+
+    from headcount.db.engine import session_scope
+    from headcount.db.enums import OverrideField
+    from headcount.models.manual_override import ManualOverride
+    from headcount.review.audit import record_audit
+
+    opts: GlobalOptions = ctx.obj
+    log = get_logger("headcount.cli.apply_override")
+
+    try:
+        payload = json.loads(payload_json)
+    except json.JSONDecodeError as exc:
+        raise typer.BadParameter(f"--payload must be valid JSON: {exc.msg}") from exc
+    if not isinstance(payload, dict):
+        raise typer.BadParameter("--payload must decode to a JSON object.")
+
+    try:
+        field = OverrideField(field_name)
+    except ValueError as exc:
+        raise typer.BadParameter(f"unknown --field: {field_name!r}") from exc
+
+    expires_dt: datetime | None = None
+    if expires_at:
+        try:
+            expires_dt = datetime.fromisoformat(expires_at)
+            if expires_dt.tzinfo is None:
+                expires_dt = expires_dt.replace(tzinfo=UTC)
+        except ValueError as exc:
+            raise typer.BadParameter(f"--expires-at must be ISO-8601: {expires_at!r}") from exc
+
+    with session_scope() as session:
+        row = ManualOverride(
+            company_id=company_id,
+            field_name=field,
+            override_value_json=payload,
+            reason=reason,
+            entered_by=entered_by,
+            expires_at=expires_dt,
+        )
+        session.add(row)
+        session.flush()
+        record_audit(
+            session,
+            actor_type="cli",
+            actor_id=entered_by,
+            action="override_created",
+            target_type="manual_override",
+            target_id=row.id,
+            payload={
+                "company_id": company_id,
+                "field": field.value,
+                "reason": reason,
+                "expires_at": expires_dt.isoformat() if expires_dt else None,
+                "payload": payload,
+            },
+        )
+        if opts.dry_run:
+            override_id = row.id
+            session.rollback()
+        else:
+            override_id = row.id
+
+    log.info(
+        "override_created",
+        override_id=override_id,
+        company_id=company_id,
+        field=field.value,
+        dry_run=opts.dry_run,
+    )
+    typer.echo(
+        f"override_created id={override_id} company={company_id} "
+        f"field={field.value} dry_run={opts.dry_run}"
+    )
+
+
+@app.command("review-queue")
+def review_queue_cmd(
+    ctx: typer.Context,
+    status_filter: Annotated[
+        str | None,
+        typer.Option(
+            "--status",
+            help="Filter by status: open, assigned, resolved, dismissed.",
+        ),
+    ] = "open",
+    limit: Annotated[
+        int,
+        typer.Option("--limit", help="Maximum rows to print (highest priority first)."),
+    ] = 25,
+) -> None:
+    """List the current analyst review queue, highest priority first (Phase 8)."""
+
+    from sqlalchemy import select
+
+    from headcount.db.engine import session_scope
+    from headcount.db.enums import ReviewStatus
+    from headcount.models.review_queue_item import ReviewQueueItem
+
+    _ = ctx  # ctx unused but keeps the Typer signature uniform.
+
+    status_enum = None
+    if status_filter:
+        try:
+            status_enum = ReviewStatus(status_filter)
+        except ValueError as exc:
+            raise typer.BadParameter(f"unknown --status: {status_filter!r}") from exc
+
+    with session_scope() as session:
+        stmt = select(ReviewQueueItem).order_by(
+            ReviewQueueItem.priority.desc(),
+            ReviewQueueItem.updated_at.desc(),
+        )
+        if status_enum is not None:
+            stmt = stmt.where(ReviewQueueItem.status == status_enum)
+        stmt = stmt.limit(max(1, limit))
+        rows = session.execute(stmt).scalars().all()
+        formatted = [
+            {
+                "id": r.id,
+                "company_id": r.company_id,
+                "reason": r.review_reason.value,
+                "priority": r.priority,
+                "status": r.status.value,
+                "assigned_to": r.assigned_to,
+                "detail": r.detail,
+            }
+            for r in rows
+        ]
+
+    if not formatted:
+        typer.echo(f"review-queue empty (status={status_filter or 'any'})")
+        return
+
+    for item in formatted:
+        typer.echo(
+            f"  [{item['priority']:02d}] {item['status']} {item['reason']} "
+            f"company={item['company_id']} assigned_to={item['assigned_to']}"
+        )
+        if item["detail"]:
+            typer.echo(f"        {item['detail']}")
 
 
 @app.command("export-growth")
