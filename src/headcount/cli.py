@@ -456,10 +456,104 @@ def collect_employment(
 @app.command("estimate-series")
 def estimate_series(
     ctx: typer.Context,
-    company_batch: Annotated[str, typer.Option("--company-batch")] = "priority",
+    company_batch: Annotated[
+        str,
+        typer.Option(
+            "--company-batch",
+            help="Reserved for future batching; currently informational only.",
+        ),
+    ] = "priority",
+    start_month: Annotated[
+        str,
+        typer.Option(
+            "--start",
+            help="First month of the output window, YYYY-MM or YYYY-MM-DD.",
+        ),
+    ] = "2020-01",
+    end_month: Annotated[
+        str | None,
+        typer.Option(
+            "--end",
+            help="Last month of the output window; defaults to --as-of.",
+        ),
+    ] = None,
+    as_of_month: Annotated[
+        str | None,
+        typer.Option(
+            "--as-of",
+            help="Reference 'now' month for coverage and open employments.",
+        ),
+    ] = None,
+    sample_floor: Annotated[
+        int,
+        typer.Option(
+            "--sample-floor",
+            help="Months with fewer live profiles than this are suppressed.",
+        ),
+    ] = 5,
+    company_id: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--company-id",
+            help="Restrict to one or more company IDs (repeat flag).",
+        ),
+    ] = None,
 ) -> None:
     """Produce monthly headcount estimates with intervals (Phase 7)."""
-    _not_yet_implemented(ctx, stage="estimate-series", company_batch=company_batch)
+
+    from datetime import date
+
+    from headcount.db.engine import session_scope
+    from headcount.estimate.pipeline import estimate_series as run_estimate
+
+    def _parse_month(raw: str) -> date:
+        raw = raw.strip()
+        if len(raw) == 7:
+            raw = f"{raw}-01"
+        try:
+            return date.fromisoformat(raw).replace(day=1)
+        except ValueError as exc:
+            raise typer.BadParameter(f"expected YYYY-MM or YYYY-MM-DD, got {raw!r}") from exc
+
+    start = _parse_month(start_month)
+    end = _parse_month(end_month) if end_month else None
+    as_of = _parse_month(as_of_month) if as_of_month else None
+
+    opts: GlobalOptions = ctx.obj
+    log = get_logger("headcount.cli.estimate_series")
+
+    with session_scope() as session:
+        result = run_estimate(
+            session,
+            start_month=start,
+            end_month=end,
+            as_of_month=as_of,
+            company_ids=list(company_id) if company_id else None,
+            sample_floor=sample_floor,
+            note=f"batch={company_batch}",
+        )
+        if opts.dry_run:
+            session.rollback()
+
+    log.info(
+        "estimate_series_done",
+        run_id=result.run_id,
+        companies_attempted=result.companies_attempted,
+        companies_succeeded=result.companies_succeeded,
+        companies_failed=result.companies_failed,
+        companies_degraded=result.companies_degraded,
+        months_written=result.months_written,
+        months_flagged=result.months_flagged,
+        final_status=result.final_status.value,
+        dry_run=opts.dry_run,
+    )
+    typer.echo(
+        f"estimate_series run={result.run_id} "
+        f"status={result.final_status.value} "
+        f"companies={result.companies_succeeded}/{result.companies_attempted} "
+        f"(failed={result.companies_failed}, degraded={result.companies_degraded}); "
+        f"months={result.months_written} flagged={result.months_flagged}"
+    )
 
 
 @app.command("score-confidence")

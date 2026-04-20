@@ -172,9 +172,7 @@ def parse_month(raw: str, *, max_year: int | None = None) -> ParsedMonth | None:
     if m:
         q = int(m.group("q"))
         normalized_year = _normalize_two_digit_year(m.group("year"))
-        if normalized_year is not None and _year_is_sane(
-            normalized_year, max_year=max_year
-        ):
+        if normalized_year is not None and _year_is_sane(normalized_year, max_year=max_year):
             return ParsedMonth(
                 month=date(normalized_year, 1 + 3 * (q - 1), 1),
                 raw=raw,

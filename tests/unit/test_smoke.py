@@ -70,8 +70,10 @@ def test_cli_version_command() -> None:
 
 
 def test_cli_stub_returns_exit_code_two() -> None:
+    # ``collect-employment`` is still a Phase 7.5+ stub and returns
+    # exit_code=2 until wired.
     runner = CliRunner()
-    result = runner.invoke(cli_app, ["estimate-series", "--company-batch", "smoke"])
+    result = runner.invoke(cli_app, ["collect-employment", "--company-batch", "smoke"])
     assert result.exit_code == 2
 
 
