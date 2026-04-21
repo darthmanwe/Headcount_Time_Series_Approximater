@@ -49,16 +49,37 @@ from headcount.utils.time import month_floor
 
 _log = get_logger("headcount.ingest.observers.company_web")
 
-_DEFAULT_PATHS: tuple[str, ...] = ("/", "/about", "/about-us", "/company", "/careers")
+_DEFAULT_PATHS: tuple[str, ...] = (
+    "/",
+    "/about",
+    "/about-us",
+    "/about/company",
+    "/company",
+    "/team",
+    "/our-team",
+    "/leadership",
+    "/people",
+    "/careers",
+)
 
 
 class CompanyWebObserver(AnchorSourceAdapter):
-    """Scrapes a short allow-list of common company-site paths."""
+    """Scrapes a short allow-list of common company-site paths.
+
+    A ``403`` on a single path is treated as a soft per-path skip,
+    not a hard adapter gate, because many sites aggressively 403
+    their homepage to bots while still serving ``/about`` or
+    ``/team`` without restriction. We only escalate to a gate if
+    *every* path we tried came back 403 (i.e. there is nowhere we
+    can read even metadata from).
+    """
 
     source_name = SourceName.company_web
     parser_version = COMPANY_WEB_PARSER_VERSION
 
-    def __init__(self, *, paths: tuple[str, ...] = _DEFAULT_PATHS, max_paths: int = 4) -> None:
+    def __init__(
+        self, *, paths: tuple[str, ...] = _DEFAULT_PATHS, max_paths: int = 8
+    ) -> None:
         super().__init__()
         self._paths = paths
         self._max_paths = max_paths
@@ -74,6 +95,8 @@ class CompanyWebObserver(AnchorSourceAdapter):
         base = f"https://{target.canonical_domain}".rstrip("/")
         anchor_month: date = month_floor(date.today())
         signals: list[RawAnchorSignal] = []
+        paths_tried = 0
+        paths_forbidden = 0
 
         for path in self._paths[: self._max_paths]:
             url = urljoin(base + "/", path.lstrip("/"))
@@ -81,8 +104,10 @@ class CompanyWebObserver(AnchorSourceAdapter):
                 response = await context.http.get(self.source_name, url)
             except Exception as exc:  # pragma: no cover - network failure path
                 raise AdapterFetchError(f"company_web fetch failed: {exc!r}") from exc
+            paths_tried += 1
             if response.status_code == 403:
-                raise AdapterGatedError(f"{url} returned 403")
+                paths_forbidden += 1
+                continue
             if response.status_code == 404:
                 continue
             if response.status_code >= 400:
@@ -116,10 +141,20 @@ class CompanyWebObserver(AnchorSourceAdapter):
                 )
             if signals:
                 break
+
+        # Every path refused us - that is a real gate. Raising here so
+        # the collect layer can surface it in the per-source summary.
+        if paths_tried > 0 and paths_forbidden == paths_tried and not signals:
+            raise AdapterGatedError(
+                f"{target.canonical_domain} forbid every path tried"
+            )
+
         _log.info(
             "company_web_anchor_hits",
             company_id=target.company_id,
             matched=len(signals),
             domain=target.canonical_domain,
+            paths_tried=paths_tried,
+            paths_forbidden=paths_forbidden,
         )
         return signals

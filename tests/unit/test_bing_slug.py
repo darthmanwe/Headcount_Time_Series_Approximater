@@ -62,6 +62,26 @@ class TestExtractLinkedInSlugs:
         )
         assert extract_linkedin_slugs(body) == ["hidden-corp"]
 
+    def test_decodes_ddg_redirect(self) -> None:
+        # DDG wraps organic results as //duckduckgo.com/l/?uddg=<enc>&...
+        body = (
+            '<a class="result__a" href="//duckduckgo.com/l/?uddg='
+            "https%3A%2F%2Fwww.linkedin.com%2Fcompany%2Fddg-found%2F"
+            '&rut=abc">DDG-Found</a>'
+        )
+        assert extract_linkedin_slugs(body) == ["ddg-found"]
+
+    def test_mixed_ddg_and_bing(self) -> None:
+        body = (
+            '<a href="//duckduckgo.com/l/?uddg='
+            "https%3A%2F%2Fwww.linkedin.com%2Fcompany%2Fddg-co%2F"
+            '&rut=x">one</a>'
+            '<a href="https://www.bing.com/ck/a?!&u='
+            "https%3a%2f%2fwww.linkedin.com%2fcompany%2fbing-co%2f&ntb=1"
+            '">two</a>'
+        )
+        assert set(extract_linkedin_slugs(body)) == {"ddg-co", "bing-co"}
+
     def test_respects_max_candidates(self) -> None:
         body = "".join(
             f'<a href="https://www.linkedin.com/company/c{i}/">x</a>'
@@ -84,7 +104,9 @@ class TestHostIsLinkedIn:
 
 
 class TestFetchBingCandidates:
-    def test_one_request_one_query(self, tmp_path: Path) -> None:
+    def test_ddg_is_primary_source(self, tmp_path: Path) -> None:
+        """DDG is tried first; its hits short-circuit Bing entirely."""
+
         seen: list[str] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -107,9 +129,68 @@ class TestFetchBingCandidates:
 
         slugs = asyncio.run(_run())
         assert slugs == ["acme-corp"]
-        assert len(seen) == 1
-        assert "bing.com/search" in seen[0]
+        assert len(seen) == 1, "Bing should NOT be called when DDG returns hits"
+        assert "duckduckgo.com" in seen[0]
         assert "site%3Alinkedin.com%2Fcompany" in seen[0]
+
+    def test_falls_back_to_bing_when_ddg_empty(self, tmp_path: Path) -> None:
+        """DDG returning zero slugs triggers a Bing fallback query."""
+
+        seen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(str(request.url))
+            host = request.url.host
+            if "duckduckgo" in host:
+                return httpx.Response(200, text="<html>no linkedin here</html>")
+            return httpx.Response(
+                200,
+                text=(
+                    '<html><body><a href="https://www.linkedin.com/company/'
+                    'acme-bing/">Acme</a></body></html>'
+                ),
+            )
+
+        http = _make_http(tmp_path, handler)
+
+        async def _run():
+            async with http:
+                return await fetch_bing_slug_candidates(
+                    name="Acme", domain="acme.io", http=http
+                )
+
+        slugs = asyncio.run(_run())
+        assert slugs == ["acme-bing"]
+        # One DDG probe, one Bing probe.
+        assert len(seen) == 2
+        assert "duckduckgo.com" in seen[0]
+        assert "bing.com/search" in seen[1]
+
+    def test_bing_captcha_page_returns_no_slugs(self, tmp_path: Path) -> None:
+        """Bing CAPTCHA interstitial must not be parsed for slugs."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            host = request.url.host
+            if "duckduckgo" in host:
+                return httpx.Response(200, text="")
+            return httpx.Response(
+                200,
+                text=(
+                    "<html><body>Please complete the captcha to verify "
+                    "you are a human. <a href='https://www.linkedin.com/"
+                    "company/some-taxonomy/'>chrome</a></body></html>"
+                ),
+            )
+
+        http = _make_http(tmp_path, handler)
+
+        async def _run():
+            async with http:
+                return await fetch_bing_slug_candidates(
+                    name="Acme", domain="acme.io", http=http
+                )
+
+        assert asyncio.run(_run()) == []
 
 
 class TestResolverFallsBackToBing:
@@ -119,7 +200,9 @@ class TestResolverFallsBackToBing:
         def handler(request: httpx.Request) -> httpx.Response:
             host = request.url.host
             path = request.url.path
-            if host.endswith("bing.com") and path == "/search":
+            if "duckduckgo" in host or (
+                host.endswith("bing.com") and path == "/search"
+            ):
                 return httpx.Response(
                     200,
                     text=(

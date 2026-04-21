@@ -692,6 +692,7 @@ def _main(argv: list[str]) -> int:
         # would silently no-op. Infer the slug from domain/name and
         # verify via a logged-out /company/<slug>/ probe.
         t0 = time.time()
+        slug_http: HttpClient | None = None
         if args.mode in {"live-safe", "live-full"}:
             try:
                 settings = get_settings()
@@ -783,7 +784,51 @@ def _main(argv: list[str]) -> int:
             assert not rate_guard.is_circuit_open(), (
                 "guard should be re-armed after sleeping cooldown"
             )
+
+            # Some deferred companies tripped the breaker during the
+            # slug backfill and therefore never had a linkedin URL
+            # persisted to the DB. Re-run slug backfill for just those
+            # IDs before the observer retry so the observer actually
+            # has something to fetch.
+            deferred_set = set(deferred)
+            missing_slug_ids = [
+                c.id
+                for c in companies
+                if c.id in deferred_set
+                and not (
+                    getattr(c, "linkedin_company_url", None)
+                    and str(c.linkedin_company_url).strip()
+                )
+            ]
+            # linkedin_company_url lives on the ORM row; re-fetch so
+            # we see URLs that were persisted in the primary backfill
+            # (those companies were deferred by the *observer* after
+            # their slug was already known - we skip those here).
+            if missing_slug_ids and slug_http is not None:
+                try:
+                    retry_slug_stats = backfill_linkedin_slugs(
+                        session,
+                        company_ids=missing_slug_ids,
+                        http=slug_http,
+                        rate_guard=rate_guard,
+                    )
+                    retry_meta["retry_slug_backfill"] = retry_slug_stats
+                except Exception as exc:
+                    ctx.add(
+                        stage="collect_anchors_retry",
+                        severity="warn",
+                        message="breaker-recovery slug backfill raised",
+                        detail={"error": str(exc)},
+                    )
+                    retry_meta["retry_slug_backfill_error"] = str(exc)
+
+            # Refresh ORM state so the observer sees slugs that just
+            # got persisted by the retry backfill.
+            session.commit()
             retry_companies = [c for c in companies if c.id in set(deferred)]
+            for c in retry_companies:
+                session.refresh(c)
+
             t1 = time.time()
             try:
                 retry_summary = asyncio.run(

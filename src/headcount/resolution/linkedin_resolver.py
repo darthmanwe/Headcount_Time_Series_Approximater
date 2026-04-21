@@ -259,6 +259,17 @@ def disambiguate_match(
         offending = next(e for e in extras if e in _AMBIGUOUS_QUALIFIERS)
         return False, f"ambiguous_qualifier:{offending}"
 
+    # Single-token names are the most collision-prone case on LinkedIn
+    # (generic English words like "Alloy", "Alleva", "Arable" map to
+    # many unrelated companies). If the caller provided a canonical
+    # domain but the LinkedIn page does not mention it anywhere, refuse
+    # the match. The resolver will fall through to Bing / DDG and try
+    # to find the real slug. False rejections are preferable to false
+    # positives here because misattributed headcounts end up as real
+    # numeric errors in the scoreboard.
+    if len(sig_name) == 1 and domain:
+        return False, "single_token_no_domain_in_body"
+
     return True, "ok"
 
 

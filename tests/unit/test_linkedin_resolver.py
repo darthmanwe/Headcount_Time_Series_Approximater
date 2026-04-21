@@ -257,6 +257,47 @@ class TestDisambiguateMatch:
         )
         assert accepted is True
 
+    def test_rejects_single_token_when_domain_missing_from_body(self) -> None:
+        # "Alleva" slug on LinkedIn points to the Belgian ALLEVA company,
+        # not the US helloalleva.com target. The title matches, but
+        # helloalleva.com never appears in the body, so we must refuse.
+        accepted, reason = disambiguate_match(
+            title="ALLEVA | LinkedIn",
+            name="Alleva",
+            domain="helloalleva.com",
+            body=(
+                "<html><head><title>ALLEVA | LinkedIn</title></head>"
+                "<body><p>Located in Belgium</p></body></html>"
+            ),
+        )
+        assert accepted is False
+        assert reason == "single_token_no_domain_in_body"
+
+    def test_accepts_single_token_when_domain_in_body(self) -> None:
+        # Same single-token name, but the canonical domain literally
+        # appears in the body - that's a clean positive match.
+        accepted, reason = disambiguate_match(
+            title="15Five | LinkedIn",
+            name="15Five",
+            domain="15five.com",
+            body="<html><body><a href='https://15five.com'>Site</a></body></html>",
+        )
+        assert accepted is True
+        assert reason == "domain_in_body"
+
+    def test_allows_single_token_without_domain_input(self) -> None:
+        # When the caller gives us no canonical domain, single-token
+        # names cannot be domain-verified, so we must not reject on
+        # that axis - the old behaviour is preserved.
+        accepted, reason = disambiguate_match(
+            title="Acme | LinkedIn",
+            name="Acme",
+            domain=None,
+            body="<html></html>",
+        )
+        assert accepted is True
+        assert reason == "ok"
+
 
 class TestResolverWithGuard:
     """Resolver integration with the shared :class:`LinkedInRateGuard`."""
