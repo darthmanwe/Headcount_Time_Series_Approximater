@@ -406,6 +406,7 @@ async def resolve_linkedin_slug(
         attempts.append((slug, method, verdict))
         return result
 
+    heuristic_gated = False
     for slug, method in slug_candidates(name, domain):
         result = await _try_slug(slug, method)
         if result is not None:
@@ -429,6 +430,15 @@ async def resolve_linkedin_slug(
                 attempts=attempts,
             )
             return None
+        # If the first heuristic probe for this company was gated, the
+        # remaining candidates will almost certainly 999 too (same host,
+        # same IP, seconds apart). Burn the whole slug budget here and
+        # we get fewer successful probes per cohort. Fast-fail the
+        # heuristic loop and let Bing/DDG try a fresh path; if that also
+        # fails the caller will defer the company for the recovery pass.
+        if attempts and attempts[-1][2] == "gated":
+            heuristic_gated = True
+            break
 
     # Lever L6: heuristic candidates exhausted. Ask Bing.
     # Bing is queried at most once per company, on a different host
@@ -461,6 +471,15 @@ async def resolve_linkedin_slug(
                 if company_id:
                     guard.defer_company(company_id)
                 break
+
+    # If any attempt was blocked by LinkedIn (status 999/429/403), park
+    # the company on the guard's deferred queue so the breaker-recovery
+    # pass can replay slug discovery after the cooldown. Without this,
+    # the first N companies whose probes return 999 before the breaker
+    # trips (threshold is N by construction) are permanently lost.
+    any_gated = any(verdict == "gated" for _slug, _method, verdict in attempts)
+    if any_gated and company_id:
+        guard.defer_company(company_id)
 
     _log.info(
         "linkedin_slug_unresolved",

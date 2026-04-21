@@ -563,6 +563,18 @@ def _main(argv: list[str]) -> int:
             " local feedback loops."
         ),
     )
+    parser.add_argument(
+        "--breaker-recovery-floor-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum cooldown (seconds) to sleep before the"
+            " breaker-recovery pass, even if the breaker never tripped."
+            " The script takes max(this floor, guard cooldown, 120s)."
+            " Use higher values (eg 900) when LinkedIn has been issuing"
+            " 999s without the breaker fully tripping."
+        ),
+    )
     args = parser.parse_args(argv)
 
     run_dir = (
@@ -772,7 +784,15 @@ def _main(argv: list[str]) -> int:
             "trips_observed": rate_guard.trip_count,
         }
         if deferred and args.retry_breaker_skips and args.mode == "live-full":
-            cooldown = max(1.0, rate_guard.cooldown_remaining() + 5.0)
+            # Floor the cooldown at a meaningful pause even when the
+            # breaker never tripped (eg. some companies 999'd but the
+            # streak stayed under the threshold). Without this the
+            # retry would fire immediately and almost certainly 999
+            # again against a soft-flagged IP.
+            recovery_floor = max(
+                120.0, float(args.breaker_recovery_floor_seconds or 0.0)
+            )
+            cooldown = max(recovery_floor, rate_guard.cooldown_remaining() + 5.0)
             retry_meta["cooldown_slept_seconds"] = cooldown
             print(
                 f"[breaker-recovery] sleeping {cooldown:.1f}s for cooldown,"

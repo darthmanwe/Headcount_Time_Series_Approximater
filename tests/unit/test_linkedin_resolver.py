@@ -328,20 +328,30 @@ class TestResolverWithGuard:
 
     def test_status_gate_feeds_breaker(self, tmp_path: Path) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(999, text="bot wall")
+            if "linkedin.com" in (request.url.host or ""):
+                return httpx.Response(999, text="bot wall")
+            # Bing/DDG hosts: return a non-200 so the fallback produces
+            # no slugs and the resolver completes without a hit.
+            return httpx.Response(200, text="<html></html>")
 
-        guard = _quiet_guard(circuit_threshold=2)
+        guard = _quiet_guard(circuit_threshold=1)
         http = _make_http(tmp_path, handler)
-        # Two probes per resolve attempt (domain_label + name_slug + name_concat
-        # share the same gated response). The first resolve walks through
-        # all three slug candidates -> 3 gate notes -> breaker trips on
-        # the 2nd note.
+        # With fast-fail-on-gate, only the *first* heuristic probe runs
+        # per resolve before we punt to Bing/DDG. One gate is enough to
+        # trip a threshold=1 breaker. This mirrors real runs where a
+        # 999 on the first candidate is a reliable "skip this company"
+        # signal.
         result = _resolve(
-            http, name="Acme Corp", domain="acme.io", rate_guard=guard
+            http,
+            name="Acme Corp",
+            domain="acme.io",
+            rate_guard=guard,
+            company_id="c-acme",
         )
         assert result is None
-        assert guard.consecutive_gates >= 2
+        assert guard.consecutive_gates >= 1
         assert guard.is_circuit_open()
+        assert "c-acme" in guard.deferred_companies
 
     def test_budget_exhausted_short_circuits_probe(self, tmp_path: Path) -> None:
         seen_urls: list[str] = []
@@ -372,6 +382,37 @@ class TestResolverWithGuard:
         ]
         assert linkedin_calls == [], (
             f"budget cap must skip LinkedIn calls, saw {linkedin_calls}"
+        )
+
+    def test_defers_company_when_gated_below_breaker_threshold(
+        self, tmp_path: Path
+    ) -> None:
+        """Companies whose slug probe 999s should be deferred even when the
+        breaker hasn't tripped, so the recovery pass retries them.
+
+        Without this, the first N companies to be gated (where N is the
+        breaker threshold - 1) are permanently lost because the breaker
+        hasn't opened yet so no ``defer_company`` fires.
+        """
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(999, text="bot wall")
+
+        guard = _quiet_guard(circuit_threshold=99)  # deliberately far away
+        http = _make_http(tmp_path, handler)
+        result = _resolve(
+            http,
+            name="AliveCor",
+            domain="alivecor.com",
+            rate_guard=guard,
+            company_id="company-livecor",
+        )
+        assert result is None
+        assert not guard.is_circuit_open(), (
+            "breaker threshold is 99, should not trip on a single company"
+        )
+        assert "company-livecor" in guard.deferred_companies, (
+            "slug-gated companies must be parked for the recovery pass"
         )
 
     def test_resolver_clears_streak_on_verified_hit(self, tmp_path: Path) -> None:
