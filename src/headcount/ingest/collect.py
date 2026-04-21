@@ -48,6 +48,10 @@ from headcount.ingest.base import (
     FetchReport,
     RawAnchorSignal,
 )
+from headcount.ingest.browser_fingerprint import (
+    BROWSER_NAV_HEADERS,
+    pick_user_agent,
+)
 from headcount.ingest.http import FileCache, HttpClient, HttpClientConfig
 from headcount.ingest.rate_limit import (
     BudgetExhaustedError,
@@ -462,7 +466,15 @@ def default_http_configs() -> dict[SourceName, HttpClientConfig]:
             default_headers={"Accept": "application/sparql-results+json"},
         ),
         SourceName.linkedin_public: HttpClientConfig(
-            user_agent=("Headcount-Estimator/0.1 (+internal-use; contact@example.com)"),
+            # Lever L1 (docs/LINKEDIN_BOT_WALL_STRATEGY.md): present as a
+            # real browser doing a top-level navigation. Generic
+            # identifying UAs get a near-instant 999 from the public
+            # wall; a curated modern-Chromium UA + the matching header
+            # bundle consistently gets us a 200 with the parseable HTML
+            # shell. One UA is chosen per process so a run looks like a
+            # single human session, not a UA-flipping scraper.
+            user_agent=pick_user_agent(),
+            default_headers=BROWSER_NAV_HEADERS,
             # Logged-out LinkedIn walls aggressive traffic: keep the
             # concurrency at 1 and cache aggressively so re-runs are
             # essentially free until the TTL rolls.
