@@ -19,6 +19,7 @@ class Company(UUIDPk, Timestamped, Base):
     canonical_name: Mapped[str] = mapped_column(String(512), nullable=False)
     canonical_domain: Mapped[str | None] = mapped_column(String(255), nullable=True)
     linkedin_company_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    linkedin_resolved_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     country: Mapped[str | None] = mapped_column(String(64), nullable=True)
     state_or_region: Mapped[str | None] = mapped_column(String(128), nullable=True)
     status: Mapped[CompanyStatus] = mapped_column(

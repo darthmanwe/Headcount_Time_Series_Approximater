@@ -550,6 +550,7 @@ def backfill_linkedin_slugs(
                         stats["unresolved"] += 1
                     continue
                 company.linkedin_company_url = result.url
+                company.linkedin_resolved_url = result.url
                 stats["resolved"] += 1
 
     asyncio.run(_run())
