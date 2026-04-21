@@ -11,6 +11,7 @@ once on the parent ``hc`` app and threaded through via a Typer context.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -35,6 +36,14 @@ class GlobalOptions:
     limit: int | None
     priority_tier: str | None
     dry_run: bool
+
+
+def _raw_response_archive_enabled() -> bool:
+    """Return whether live HTTP responses should be archived."""
+    raw = os.environ.get("HEADCOUNT_RAW_RESPONSE_ARCHIVE", "").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return True
 
 
 def _version_callback(value: bool) -> None:
@@ -415,7 +424,7 @@ def collect_anchors(
             # Offline / canned-transport runs would pollute the archive
             # with test fixtures that have no real upstream provenance.
             raw_sink = None
-            if live:
+            if live and _raw_response_archive_enabled():
                 from headcount.ingest.raw_response_store import (
                     build_sink_from_session,
                 )
@@ -1547,7 +1556,7 @@ def run_pipeline(
         settings = get_settings()
         cache = FileCache(settings.cache_dir)
         raw_sink = None
-        if live:
+        if live and _raw_response_archive_enabled():
             from headcount.ingest.raw_response_store import (
                 build_sink_from_session,
             )
