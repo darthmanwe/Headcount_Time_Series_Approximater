@@ -36,6 +36,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
+from headcount.config.settings import get_settings
 from headcount.db.enums import (
     AnchorType,
     HeadcountValueKind,
@@ -79,14 +80,44 @@ def _resolve_slug(target: CompanyTarget) -> str | None:
 
 
 class LinkedInPublicObserver(AnchorSourceAdapter):
-    """Logged-out ``/company/<slug>`` headcount-badge observer."""
+    """Logged-out ``/company/<slug>`` headcount-badge observer.
+
+    Ships a lightweight circuit breaker (lever L4 in
+    ``docs/LINKEDIN_BOT_WALL_STRATEGY.md``): after a configurable streak
+    of gate responses on the primary URL we stop issuing LinkedIn
+    requests for the rest of the run. The streak resets to zero each
+    time a company yields any parsed signal, so a single transient
+    soft-gate does not poison the observer for a whole batch.
+    """
 
     source_name = SourceName.linkedin_public
     parser_version = LINKEDIN_PUBLIC_PARSER_VERSION
 
-    def __init__(self, *, anchor_month: date | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        anchor_month: date | None = None,
+        circuit_threshold: int | None = None,
+    ) -> None:
         super().__init__()
         self._anchor_month = anchor_month
+        if circuit_threshold is None:
+            circuit_threshold = get_settings().linkedin_public_circuit_breaker_n
+        self._circuit_threshold = max(1, int(circuit_threshold))
+        self._consecutive_gates = 0
+        self._circuit_open = False
+
+    @property
+    def consecutive_gates(self) -> int:
+        """Number of successive gated primary fetches since last success."""
+
+        return self._consecutive_gates
+
+    @property
+    def circuit_open(self) -> bool:
+        """True once the streak hit the configured threshold for this run."""
+
+        return self._circuit_open
 
     async def fetch_current_anchor(
         self,
@@ -105,11 +136,29 @@ class LinkedInPublicObserver(AnchorSourceAdapter):
             )
             return []
 
+        if self._circuit_open:
+            # Lever L4: once tripped, skip LinkedIn for every subsequent
+            # company in this run. We avoid the HTTP round-trip entirely
+            # instead of sending more requests that are statistically
+            # certain to be 999-walled, which is the exact pattern
+            # LinkedIn uses to extend the ban window.
+            linkedin_gate_total.labels(reason="circuit_open").inc()
+            _log.warning(
+                "linkedin_public_circuit_open_skip",
+                company_id=target.company_id,
+                slug=slug,
+            )
+            return []
+
         anchor_month = self._anchor_month or month_floor(date.today())
         signals: list[RawAnchorSignal] = []
 
         primary_url = COMPANY_URL.format(slug=slug)
-        primary = await self._fetch(context, primary_url, purpose="company")
+        try:
+            primary = await self._fetch(context, primary_url, purpose="company")
+        except AdapterGatedError:
+            self._note_primary_gate()
+            raise
         if primary is None:
             return []
         primary_body = primary.text or ""
@@ -127,7 +176,14 @@ class LinkedInPublicObserver(AnchorSourceAdapter):
             badge = extract_linkedin_badge(primary_body)
             if badge is None:
                 about_url = COMPANY_ABOUT_URL.format(slug=slug)
-                about = await self._fetch(context, about_url, purpose="about")
+                try:
+                    about = await self._fetch(context, about_url, purpose="about")
+                except AdapterGatedError:
+                    # A gate on /about after a clean primary is also a
+                    # signal we're being fingerprinted; count it toward
+                    # the breaker before re-raising.
+                    self._note_primary_gate()
+                    raise
                 if about is None:
                     return []
                 about_body = about.text or ""
@@ -146,6 +202,11 @@ class LinkedInPublicObserver(AnchorSourceAdapter):
             assert badge is not None  # narrowed above; kept for mypy
             signals.append(self._badge_signal(slug, badge, signal_source_url, anchor_month))
 
+        # Any successfully parsed signal clears the streak: LinkedIn is
+        # still talking to us, whatever transient blip tripped earlier
+        # attempts has passed.
+        self._note_success()
+
         try:
             people_url = COMPANY_PEOPLE_URL.format(slug=slug)
             people = await self._fetch(context, people_url, purpose="people", soft_gate=True)
@@ -158,6 +219,29 @@ class LinkedInPublicObserver(AnchorSourceAdapter):
                 signals.append(self._exact_signal(slug, count, phrase, people_url, anchor_month))
 
         return signals
+
+    def _note_primary_gate(self) -> None:
+        """Bump the gate streak and trip the breaker when it saturates."""
+
+        self._consecutive_gates += 1
+        if self._consecutive_gates >= self._circuit_threshold and not self._circuit_open:
+            self._circuit_open = True
+            linkedin_gate_total.labels(reason="circuit_tripped").inc()
+            _log.error(
+                "linkedin_public_circuit_tripped",
+                threshold=self._circuit_threshold,
+                streak=self._consecutive_gates,
+            )
+
+    def _note_success(self) -> None:
+        """Reset the breaker once we actually parsed a signal."""
+
+        if self._consecutive_gates:
+            _log.info(
+                "linkedin_public_circuit_streak_reset",
+                previous_streak=self._consecutive_gates,
+            )
+        self._consecutive_gates = 0
 
     async def _fetch(
         self,

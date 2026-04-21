@@ -99,6 +99,11 @@ class ParsedBadge:
 
 def looks_gated_linkedin(status_code: int, text: str, final_url: str) -> str | None:
     """Return a structured gate reason for a LinkedIn response, else None."""
+    if status_code == 999:
+        # LinkedIn's non-standard "soft bot wall" status. RFC-wise
+        # undefined; in practice signals "you have been flagged, stop
+        # asking". We classify it like 429 so the breaker can act on it.
+        return "bot_wall"
     if status_code == 429:
         return "rate_limited"
     if status_code == 403:

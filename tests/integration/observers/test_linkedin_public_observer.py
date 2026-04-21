@@ -283,6 +283,98 @@ async def test_linkedin_uses_jsonld_range_when_visible_badge_absent(
 
 
 @pytest.mark.asyncio
+async def test_linkedin_999_is_classified_as_bot_wall(fetch_context) -> None:
+    """L4 pre-req: HTTP 999 must route through the gate classifier.
+
+    Without this, 999 falls into the generic 4xx branch and raises
+    ``AdapterFetchError``, which bypasses the breaker entirely.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(999, text="we-do-not-talk-to-bots")
+
+    client, context = fetch_context(handler)
+    async with client:
+        with pytest.raises(AdapterGatedError):
+            await LinkedInPublicObserver().fetch_current_anchor(
+                _target(slug="bot-walled", company_id="c-bw"), context=context
+            )
+
+
+@pytest.mark.asyncio
+async def test_linkedin_circuit_trips_after_threshold(fetch_context) -> None:
+    """L4: the breaker trips after N consecutive primary-gate responses.
+
+    We configure the observer with ``circuit_threshold=2`` and feed it
+    three companies that all hit a 999 wall. The third company must
+    short-circuit without making any HTTP request and return [] with a
+    ``circuit_open`` gauge bump - confirming both the trip and the
+    skip-next behaviour.
+    """
+
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return httpx.Response(999, text="bot wall")
+
+    observer = LinkedInPublicObserver(circuit_threshold=2)
+    client, context = fetch_context(handler)
+    async with client:
+        with pytest.raises(AdapterGatedError):
+            await observer.fetch_current_anchor(
+                _target(slug="a", company_id="c-a"), context=context
+            )
+        assert observer.consecutive_gates == 1
+        assert observer.circuit_open is False
+
+        with pytest.raises(AdapterGatedError):
+            await observer.fetch_current_anchor(
+                _target(slug="b", company_id="c-b"), context=context
+            )
+        assert observer.consecutive_gates == 2
+        assert observer.circuit_open is True
+
+        calls_before_skip = call_count
+        # Third company: circuit open, must skip HTTP entirely.
+        signals = await observer.fetch_current_anchor(
+            _target(slug="c", company_id="c-c"), context=context
+        )
+
+    assert signals == []
+    assert call_count == calls_before_skip
+
+
+@pytest.mark.asyncio
+async def test_linkedin_circuit_resets_on_successful_parse(fetch_context) -> None:
+    """Any successful parse must zero the streak for the rest of the run."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # First company: gated. Second: clean page with JSON-LD.
+        if request.url.path.startswith("/company/walled"):
+            return httpx.Response(999, text="bot wall")
+        if request.url.path == "/company/acme-inc/":
+            return httpx.Response(200, text=_li_text("company_acme_jsonld.html"))
+        return httpx.Response(404)
+
+    observer = LinkedInPublicObserver(circuit_threshold=3)
+    client, context = fetch_context(handler)
+    async with client:
+        with pytest.raises(AdapterGatedError):
+            await observer.fetch_current_anchor(
+                _target(slug="walled", company_id="c-wall"), context=context
+            )
+        assert observer.consecutive_gates == 1
+
+        signals = await observer.fetch_current_anchor(_target(), context=context)
+
+    assert signals, "clean primary page should still produce a signal"
+    assert observer.consecutive_gates == 0
+    assert observer.circuit_open is False
+
+
+@pytest.mark.asyncio
 async def test_linkedin_no_url_skips_http(fetch_context) -> None:
     calls = 0
 
