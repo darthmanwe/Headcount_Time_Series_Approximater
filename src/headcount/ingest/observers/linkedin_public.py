@@ -53,9 +53,11 @@ from headcount.ingest.base import (
 )
 from headcount.parsers.anchors import (
     LINKEDIN_PUBLIC_PARSER_VERSION,
+    LinkedInJsonLdEmployees,
     ParsedBadge,
     extract_linkedin_badge,
     extract_linkedin_exact_count,
+    extract_linkedin_jsonld_employees,
     linkedin_bucket_label,
     looks_gated_linkedin,
 )
@@ -111,21 +113,38 @@ class LinkedInPublicObserver(AnchorSourceAdapter):
         if primary is None:
             return []
         primary_body = primary.text or ""
-        badge = extract_linkedin_badge(primary_body)
 
-        if badge is None:
-            about_url = COMPANY_ABOUT_URL.format(slug=slug)
-            about = await self._fetch(context, about_url, purpose="about")
-            if about is None:
-                return []
-            badge = extract_linkedin_badge(about.text or "")
+        # Precedence (lever L2): prefer JSON-LD over the visible-text
+        # badge. The JSON-LD block is written by LinkedIn's SEO pipeline
+        # and survives auth-wall A/B tests, where the visible "Company
+        # size" copy does not. We only fall back to the badge regex when
+        # no schema-encoded numberOfEmployees exists, and we only hit
+        # /about when the primary page yielded nothing parseable at all.
+        jsonld = extract_linkedin_jsonld_employees(primary_body)
+        badge: ParsedBadge | None = None
+        signal_source_url = primary_url
+        if jsonld is None:
+            badge = extract_linkedin_badge(primary_body)
             if badge is None:
-                return []
-            badge_source_url = about_url
-        else:
-            badge_source_url = primary_url
+                about_url = COMPANY_ABOUT_URL.format(slug=slug)
+                about = await self._fetch(context, about_url, purpose="about")
+                if about is None:
+                    return []
+                about_body = about.text or ""
+                jsonld = extract_linkedin_jsonld_employees(about_body)
+                if jsonld is None:
+                    badge = extract_linkedin_badge(about_body)
+                    if badge is None:
+                        return []
+                signal_source_url = about_url
 
-        signals.append(self._badge_signal(slug, badge, badge_source_url, anchor_month))
+        if jsonld is not None:
+            signals.append(
+                self._jsonld_signal(slug, jsonld, signal_source_url, anchor_month)
+            )
+        else:
+            assert badge is not None  # narrowed above; kept for mypy
+            signals.append(self._badge_signal(slug, badge, signal_source_url, anchor_month))
 
         try:
             people_url = COMPANY_PEOPLE_URL.format(slug=slug)
@@ -220,6 +239,54 @@ class LinkedInPublicObserver(AnchorSourceAdapter):
                 "bucket_high": badge.high,
                 "open_ended": badge.open_ended,
                 "phrase": badge.phrase,
+            },
+        )
+
+    def _jsonld_signal(
+        self,
+        slug: str,
+        jsonld: LinkedInJsonLdEmployees,
+        source_url: str,
+        anchor_month: date,
+    ) -> RawAnchorSignal:
+        """Emit a signal from LinkedIn's embedded ``numberOfEmployees``.
+
+        Confidence is deliberately higher than the badge path: the
+        JSON-LD block is an explicit machine-readable contract that
+        LinkedIn maintains for search engines, whereas the visible
+        badge lives in prose that rephrases itself across experiments.
+        Exact counts get a further bump over bucketed ranges.
+        """
+
+        is_exact = jsonld.kind is HeadcountValueKind.exact
+        confidence = 0.60 if is_exact else 0.50
+        bucket_label = (
+            f"{jsonld.low}" if is_exact else linkedin_bucket_label(jsonld.low, jsonld.high)
+        )
+        note_parts = [f"slug={slug}", f"bucket={bucket_label}", "source=jsonld"]
+        return RawAnchorSignal(
+            source_name=self.source_name,
+            entity_type=SourceEntityType.company,
+            source_url=source_url,
+            anchor_month=anchor_month,
+            anchor_type=AnchorType.current_headcount_anchor,
+            headcount_value_min=float(jsonld.low),
+            headcount_value_point=jsonld.point,
+            headcount_value_max=float(jsonld.high),
+            headcount_value_kind=jsonld.kind,
+            confidence=confidence,
+            raw_text=jsonld.phrase,
+            parser_version=self.parser_version,
+            parse_status=ParseStatus.ok,
+            note=" ".join(note_parts),
+            normalized_payload={
+                "slug": slug,
+                "kind": "jsonld_exact" if is_exact else "jsonld_bucket",
+                "bucket_low": jsonld.low,
+                "bucket_high": jsonld.high,
+                "phrase": jsonld.phrase,
+                "org_name": jsonld.org_name,
+                "org_url": jsonld.org_url,
             },
         )
 

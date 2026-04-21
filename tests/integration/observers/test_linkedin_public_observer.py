@@ -229,6 +229,60 @@ async def test_linkedin_emits_people_exact_when_available(fetch_context) -> None
 
 
 @pytest.mark.asyncio
+async def test_linkedin_prefers_jsonld_exact_over_visible_bucket(
+    fetch_context,
+) -> None:
+    """L2: exact JSON-LD numberOfEmployees beats the visible badge.
+
+    The fixture embeds an exact JSON-LD value of 1250 alongside a
+    visible ``501-1,000 employees`` badge. The parser must pick the
+    JSON-LD path so the resulting signal is point-valued and carries
+    the higher confidence.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/company/acme-inc/":
+            return httpx.Response(200, text=_li_text("company_acme_jsonld.html"))
+        return httpx.Response(404)
+
+    client, context = fetch_context(handler)
+    async with client:
+        signals = await LinkedInPublicObserver().fetch_current_anchor(_target(), context=context)
+
+    assert len(signals) == 1
+    sig = signals[0]
+    assert sig.headcount_value_kind is HeadcountValueKind.exact
+    assert sig.headcount_value_point == 1250
+    assert sig.headcount_value_min == sig.headcount_value_max == 1250
+    assert sig.confidence >= 0.55
+    assert sig.normalized_payload["kind"] == "jsonld_exact"
+    assert sig.normalized_payload["org_name"] == "Acme"
+
+
+@pytest.mark.asyncio
+async def test_linkedin_uses_jsonld_range_when_visible_badge_absent(
+    fetch_context,
+) -> None:
+    """L2: JSON-LD range renders a bucket signal even with no badge text."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/company/acme-inc/":
+            return httpx.Response(200, text=_li_text("company_acme_jsonld_range.html"))
+        return httpx.Response(404)
+
+    client, context = fetch_context(handler)
+    async with client:
+        signals = await LinkedInPublicObserver().fetch_current_anchor(_target(), context=context)
+
+    assert len(signals) == 1
+    sig = signals[0]
+    assert sig.headcount_value_kind is HeadcountValueKind.bucket
+    assert sig.headcount_value_min == 51
+    assert sig.headcount_value_max == 200
+    assert sig.normalized_payload["kind"] == "jsonld_bucket"
+
+
+@pytest.mark.asyncio
 async def test_linkedin_no_url_skips_http(fetch_context) -> None:
     calls = 0
 

@@ -32,7 +32,7 @@ from headcount.utils.time import month_floor
 # Version constants
 # ---------------------------------------------------------------------------
 
-LINKEDIN_PUBLIC_PARSER_VERSION = "linkedin_public_v1"
+LINKEDIN_PUBLIC_PARSER_VERSION = "linkedin_public_v2"
 COMPANY_WEB_PARSER_VERSION = "company_web_v1"
 SEC_PARSER_VERSION = "sec_v1"
 WIKIDATA_PARSER_VERSION = "wikidata_v1"
@@ -152,6 +152,187 @@ def linkedin_bucket_label(low: int, high: int) -> str:
         if b_low == low and b_high == high:
             return label
     return f"{low}-{high}"
+
+
+# ---------------------------------------------------------------------------
+# LinkedIn JSON-LD (lever L2)
+# ---------------------------------------------------------------------------
+#
+# LinkedIn still ships a ``<script type="application/ld+json">`` block on
+# public ``/company/<slug>/`` pages even when the visible body is a login
+# wall: the SEO crew needs the structured data so that Google, Bing, and
+# AI-crawl bots can index the org. We mine that block first because it's
+# far more stable than the visible-text badge: the regex has to survive
+# A/B copy changes ("Employees", "Company size", "Team members"),
+# whereas the JSON-LD schema is an external contract.
+#
+# Expected shapes inside the Organization node:
+#   "numberOfEmployees": 1234
+#   "numberOfEmployees": {"@type": "QuantitativeValue", "value": 1234}
+#   "numberOfEmployees": {"@type": "QuantitativeValue",
+#                         "minValue": 51, "maxValue": 200}
+# The min/max variant is what LinkedIn uses in practice and it lines up
+# with the 10-bucket ladder we already model.
+
+_JSONLD_SCRIPT_RE = re.compile(
+    r"(?is)<script\b[^>]*type\s*=\s*[\"']application/ld\+json[\"'][^>]*>(.*?)</script>"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class LinkedInJsonLdEmployees:
+    """One ``numberOfEmployees`` statement lifted from LinkedIn JSON-LD."""
+
+    low: int
+    high: int
+    point: float
+    kind: HeadcountValueKind  # exact when low == high, else bucket
+    phrase: str
+    org_name: str | None
+    org_url: str | None
+
+
+def _iter_jsonld_objects(html: str) -> list[Any]:
+    """Return every JSON object parsed from ``application/ld+json`` blocks.
+
+    Each block can legally hold either a single object or a list (common
+    when a page advertises multiple schema types). We surface every
+    object so the walker below can look for Organization regardless of
+    nesting shape.
+    """
+
+    docs: list[Any] = []
+    for match in _JSONLD_SCRIPT_RE.finditer(html):
+        raw = match.group(1).strip()
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, list):
+            docs.extend(parsed)
+        else:
+            docs.append(parsed)
+    return docs
+
+
+def _is_organization_node(obj: Any) -> bool:
+    if not isinstance(obj, dict):
+        return False
+    atype = obj.get("@type")
+    if isinstance(atype, str):
+        return "Organization" in atype or atype == "Corporation"
+    if isinstance(atype, list):
+        return any(isinstance(t, str) and "Organization" in t for t in atype)
+    return False
+
+
+def _employees_from_value(node: Any) -> tuple[int, int] | None:
+    """Return ``(low, high)`` from a ``numberOfEmployees`` subtree, else None."""
+
+    if isinstance(node, (int, float)):
+        value = int(node)
+        if 1 <= value <= 10_000_000:
+            return value, value
+        return None
+    if isinstance(node, str):
+        digits = node.replace(",", "").strip()
+        if digits.isdigit():
+            value = int(digits)
+            if 1 <= value <= 10_000_000:
+                return value, value
+        return None
+    if isinstance(node, dict):
+        # QuantitativeValue with min/max.
+        try:
+            min_raw = node.get("minValue")
+            max_raw = node.get("maxValue")
+        except AttributeError:
+            min_raw = max_raw = None
+        if min_raw is not None and max_raw is not None:
+            try:
+                low = int(float(min_raw))
+                high = int(float(max_raw))
+            except (TypeError, ValueError):
+                return None
+            if low > 0 and high >= low:
+                return low, high
+        # QuantitativeValue with value (or plain {"value": N}).
+        value_raw = node.get("value")
+        if value_raw is not None:
+            try:
+                value = int(float(value_raw))
+            except (TypeError, ValueError):
+                return None
+            if 1 <= value <= 10_000_000:
+                return value, value
+    return None
+
+
+def extract_linkedin_jsonld_employees(html: str) -> LinkedInJsonLdEmployees | None:
+    """Return the first valid ``numberOfEmployees`` statement found in JSON-LD.
+
+    Walks every ``application/ld+json`` block and, within each block,
+    every nested object. Stops at the first Organization node that has
+    a parseable ``numberOfEmployees`` value; favours exact counts over
+    buckets and rejects obviously invalid values (<=0 or absurd
+    upper-bounds).
+    """
+
+    best_exact: LinkedInJsonLdEmployees | None = None
+    best_bucket: LinkedInJsonLdEmployees | None = None
+
+    def _walk(obj: Any) -> None:
+        nonlocal best_exact, best_bucket
+        if isinstance(obj, list):
+            for item in obj:
+                _walk(item)
+            return
+        if not isinstance(obj, dict):
+            return
+
+        if _is_organization_node(obj) and "numberOfEmployees" in obj:
+            bounds = _employees_from_value(obj["numberOfEmployees"])
+            if bounds is not None:
+                low, high = bounds
+                kind = (
+                    HeadcountValueKind.exact
+                    if low == high
+                    else HeadcountValueKind.bucket
+                )
+                phrase = (
+                    f"numberOfEmployees={low}"
+                    if low == high
+                    else f"numberOfEmployees={low}-{high}"
+                )
+                org_name = obj.get("name") if isinstance(obj.get("name"), str) else None
+                org_url = obj.get("url") if isinstance(obj.get("url"), str) else None
+                record = LinkedInJsonLdEmployees(
+                    low=low,
+                    high=high,
+                    point=(low + high) / 2.0,
+                    kind=kind,
+                    phrase=phrase,
+                    org_name=org_name,
+                    org_url=org_url,
+                )
+                if kind is HeadcountValueKind.exact and best_exact is None:
+                    best_exact = record
+                elif best_bucket is None:
+                    best_bucket = record
+
+        # Keep walking nested structures (schema graphs often nest).
+        for value in obj.values():
+            if isinstance(value, (dict, list)):
+                _walk(value)
+
+    for doc in _iter_jsonld_objects(html):
+        _walk(doc)
+        if best_exact is not None:
+            return best_exact
+
+    return best_exact or best_bucket
 
 
 # ---------------------------------------------------------------------------

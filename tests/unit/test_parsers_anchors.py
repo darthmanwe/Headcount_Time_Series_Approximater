@@ -19,6 +19,7 @@ from headcount.parsers.anchors import (
     SEC_PARSER_VERSION,
     WIKIDATA_PARSER_VERSION,
     clean_html_to_text,
+    extract_linkedin_jsonld_employees,
     linkedin_bucket_label,
     parse_company_web_text,
     parse_sec_company_facts,
@@ -29,7 +30,7 @@ from headcount.parsers.anchors import (
 def test_parser_versions_exposed() -> None:
     # Observers pin their parser_version to these constants; making a
     # regression noisy is the point of this test.
-    assert LINKEDIN_PUBLIC_PARSER_VERSION == "linkedin_public_v1"
+    assert LINKEDIN_PUBLIC_PARSER_VERSION == "linkedin_public_v2"
     assert COMPANY_WEB_PARSER_VERSION == "company_web_v1"
     assert SEC_PARSER_VERSION == "sec_v1"
     assert WIKIDATA_PARSER_VERSION == "wikidata_v1"
@@ -51,6 +52,135 @@ def test_clean_html_strips_tags_and_collapses_whitespace() -> None:
     assert "alert" not in text
     assert "style" not in text
     assert "Hello world we have 320 employees." in text
+
+
+# ---------------------------------------------------------------------------
+# extract_linkedin_jsonld_employees (lever L2)
+# ---------------------------------------------------------------------------
+
+
+def _jsonld_block(payload: str) -> str:
+    return (
+        '<html><head><script type="application/ld+json">'
+        + payload
+        + "</script></head><body>no badge</body></html>"
+    )
+
+
+def test_jsonld_extracts_exact_value() -> None:
+    html = _jsonld_block(
+        '{"@context":"https://schema.org","@type":"Organization",'
+        '"name":"Acme","url":"https://www.linkedin.com/company/acme/",'
+        '"numberOfEmployees":{"@type":"QuantitativeValue","value":1250}}'
+    )
+    result = extract_linkedin_jsonld_employees(html)
+    assert result is not None
+    assert result.kind is HeadcountValueKind.exact
+    assert result.low == result.high == 1250
+    assert result.point == 1250.0
+    assert result.org_name == "Acme"
+
+
+def test_jsonld_extracts_min_max_range() -> None:
+    html = _jsonld_block(
+        '{"@type":"Organization","name":"Acme",'
+        '"numberOfEmployees":{"@type":"QuantitativeValue",'
+        '"minValue":51,"maxValue":200}}'
+    )
+    result = extract_linkedin_jsonld_employees(html)
+    assert result is not None
+    assert result.kind is HeadcountValueKind.bucket
+    assert result.low == 51
+    assert result.high == 200
+    assert result.point == 125.5
+    assert "51-200" in result.phrase
+
+
+def test_jsonld_extracts_bare_integer() -> None:
+    html = _jsonld_block(
+        '{"@type":"Organization","numberOfEmployees":42}'
+    )
+    result = extract_linkedin_jsonld_employees(html)
+    assert result is not None
+    assert result.low == result.high == 42
+
+
+def test_jsonld_extracts_string_number() -> None:
+    html = _jsonld_block(
+        '{"@type":"Organization","numberOfEmployees":"12,345"}'
+    )
+    result = extract_linkedin_jsonld_employees(html)
+    assert result is not None
+    assert result.low == result.high == 12345
+
+
+def test_jsonld_prefers_exact_over_bucket_across_blocks() -> None:
+    # Two blocks: first a bucket, second an exact value. Exact must win
+    # even though it appears later in the document.
+    html = (
+        _jsonld_block(
+            '{"@type":"Organization","numberOfEmployees":'
+            '{"minValue":501,"maxValue":1000}}'
+        )
+        + _jsonld_block(
+            '{"@type":"Organization","numberOfEmployees":777}'
+        )
+    )
+    result = extract_linkedin_jsonld_employees(html)
+    assert result is not None
+    assert result.kind is HeadcountValueKind.exact
+    assert result.low == 777
+
+
+def test_jsonld_handles_graph_list() -> None:
+    html = _jsonld_block(
+        '[{"@type":"WebPage","name":"x"},'
+        '{"@type":"Organization","numberOfEmployees":{"value":500}}]'
+    )
+    result = extract_linkedin_jsonld_employees(html)
+    assert result is not None
+    assert result.low == result.high == 500
+
+
+def test_jsonld_missing_numberofemployees_returns_none() -> None:
+    html = _jsonld_block(
+        '{"@type":"Organization","name":"Acme","url":"x"}'
+    )
+    assert extract_linkedin_jsonld_employees(html) is None
+
+
+def test_jsonld_non_organization_ignored() -> None:
+    html = _jsonld_block(
+        '{"@type":"WebPage","numberOfEmployees":999}'
+    )
+    assert extract_linkedin_jsonld_employees(html) is None
+
+
+def test_jsonld_invalid_json_is_skipped_silently() -> None:
+    html = (
+        '<script type="application/ld+json">{not json</script>'
+        + _jsonld_block(
+            '{"@type":"Organization","numberOfEmployees":100}'
+        )
+    )
+    result = extract_linkedin_jsonld_employees(html)
+    assert result is not None
+    assert result.low == 100
+
+
+def test_jsonld_rejects_absurd_values() -> None:
+    html = _jsonld_block(
+        '{"@type":"Organization","numberOfEmployees":-5}'
+    )
+    assert extract_linkedin_jsonld_employees(html) is None
+    html2 = _jsonld_block(
+        '{"@type":"Organization","numberOfEmployees":{"value":0}}'
+    )
+    assert extract_linkedin_jsonld_employees(html2) is None
+
+
+def test_jsonld_no_script_returns_none() -> None:
+    assert extract_linkedin_jsonld_employees("<html></html>") is None
 
 
 # ---------------------------------------------------------------------------
