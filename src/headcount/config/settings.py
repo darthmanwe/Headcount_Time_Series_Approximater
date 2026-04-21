@@ -69,6 +69,17 @@ class Settings(BaseSettings):
     linkedin_public_request_jitter_ms_max: int = Field(
         default=1750, alias="LINKEDIN_PUBLIC_REQUEST_JITTER_MS_MAX", ge=0
     )
+    linkedin_public_circuit_cooldown_seconds: float = Field(
+        default=900.0,
+        alias="LINKEDIN_PUBLIC_CIRCUIT_COOLDOWN_SECONDS",
+        ge=0.0,
+        description=(
+            "How long the LinkedIn breaker stays open after tripping. "
+            "After this window the streak resets and the next caller is "
+            "allowed to probe again. Long-running cohort runs use this "
+            "to retry deferred companies in a second pass."
+        ),
+    )
     linkedin_public_company_ttl_days: int = Field(
         default=30, alias="LINKEDIN_PUBLIC_COMPANY_TTL_DAYS", ge=0
     )

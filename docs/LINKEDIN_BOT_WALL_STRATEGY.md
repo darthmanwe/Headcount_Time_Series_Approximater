@@ -332,6 +332,81 @@ purely free, public-page HTTP — which is the product-contract
 minimum we need before tackling the SEC / employment-collection work
 (BUG-F / BUG-H in the original report) and scaling past 25 companies.
 
+## 5a. Implementation status (2026-04-21)
+
+L1–L4 shipped and proven on the 25-company Harmonic cohort. This
+section tracks what's also shipped since the original plan and how the
+pieces fit together.
+
+### Shared `LinkedInRateGuard`
+
+Both the slug resolver (`src/headcount/resolution/linkedin_resolver.py`)
+and the public observer (`src/headcount/ingest/observers/linkedin_public.py`)
+were reaching LinkedIn with independent jitter clocks, independent
+budgets and independent breakers. For a 250–2000-company production
+run that is fatal: the resolver alone can burn the daily LinkedIn
+budget on slug discovery before the observer ever sends a single
+request, and a 999 burst against the resolver does not stop the
+observer from doubling down right afterward.
+
+`src/headcount/ingest/linkedin_guard.py` now owns that state as a
+single `LinkedInRateGuard` dataclass. The cohort runner builds one and
+injects it into `backfill_linkedin_slugs(..., rate_guard=guard)` and
+`LinkedInPublicObserver(rate_guard=guard)`. Behaviour for callers that
+omit the guard is unchanged - they get a private guard built from
+settings - so unit tests and ad-hoc scripts keep working.
+
+### Breaker cooldown + deferral queue (replaces L4's permanent skip)
+
+The original L4 tripped a boolean `_circuit_open` for the rest of the
+process. That is fine for a 25-company cohort but throws away the long
+tail in production. The guard now:
+
+- Records a UTC trip timestamp and a settings-driven cooldown window
+  (`LINKEDIN_PUBLIC_CIRCUIT_COOLDOWN_SECONDS`, default 15 min).
+- Re-arms automatically once cooldown elapses (streak resets to 0).
+- Tracks a deferred-companies queue: anyone who short-circuited on the
+  open breaker is parked for a retry pass.
+
+The cohort runner's new `--retry-breaker-skips` flag sleeps through
+the cooldown after stage 5 and re-runs `collect_anchors` for the
+deferred cohort only. Off by default so interactive runs stay snappy;
+on for overnight / production runs.
+
+### Disambiguation (Arable-class false positives)
+
+`disambiguate_match()` in the resolver layers two extra checks on top
+of the existing token-overlap test:
+
+1. If the target name is a *single* significant token and the LinkedIn
+   title introduces a generic business-type qualifier (`consulting`,
+   `partners`, `holdings`, `advisors`, …), the candidate is rejected.
+   This is what catches "Arable" → "Arable Consulting" on the `arable`
+   slug.
+2. If the canonical company domain literally appears in the response
+   body, that overrides the qualifier veto - at that point the
+   LinkedIn page is unambiguously pointing at our target's own web
+   property.
+
+### L6 — Bing SERP sidecar
+
+`src/headcount/resolution/bing_slug.py` issues a single
+`site:linkedin.com/company "<name>"` query per company when every
+heuristic slug candidate fails. Discovered slugs go through the same
+`_probe()` verification path (with disambiguation and breaker
+accounting) as heuristic candidates, so Bing can never smuggle a
+mismatched page past the guards. Runs through `HttpClient` under the
+`company_web` source config, keeping it off the LinkedIn budget.
+
+### L7 — `--cohort-slice N/M`
+
+`scripts/run_harmonic_cohort_live.py` now supports deterministic
+cohort sharding (`--cohort-slice 2/4` takes the 2nd of 4 equal slices
+after canonical-name sort). Same N/M always produces the same subset
+across runs, which is what makes multi-day / multi-shard execution
+reproducible and resumable. Covered by
+`tests/unit/test_cohort_runner_helpers.py`.
+
 ## 6. Sources
 
 - "How to Scrape LinkedIn in 2026", Scrapfly (2026-03)

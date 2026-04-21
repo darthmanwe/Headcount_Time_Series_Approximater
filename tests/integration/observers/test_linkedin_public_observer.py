@@ -28,12 +28,12 @@ def _no_jitter(monkeypatch):
     their own recording stub over the top of this one.
     """
 
-    from headcount.ingest.observers import linkedin_public as observer_module
+    from headcount.ingest import linkedin_guard as guard_module
 
     async def _instant(_seconds: float) -> None:
         return
 
-    monkeypatch.setattr(observer_module.asyncio, "sleep", _instant)
+    monkeypatch.setattr(guard_module.asyncio, "sleep", _instant)
 
 
 def _li_text(name: str) -> str:
@@ -378,14 +378,14 @@ async def test_linkedin_jitter_sleeps_between_network_calls(
 
     import random as _random
 
-    from headcount.ingest.observers import linkedin_public as observer_module
+    from headcount.ingest import linkedin_guard as guard_module
 
     sleeps: list[float] = []
 
     async def fake_sleep(seconds: float) -> None:
         sleeps.append(seconds)
 
-    monkeypatch.setattr(observer_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(guard_module.asyncio, "sleep", fake_sleep)
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, text=_li_text("company_acme_jsonld.html"))
@@ -455,14 +455,14 @@ async def test_linkedin_jitter_skips_when_previous_was_cache_hit(
     sleeps and zero network calls on that second pass.
     """
 
-    from headcount.ingest.observers import linkedin_public as observer_module
+    from headcount.ingest import linkedin_guard as guard_module
 
     sleeps: list[float] = []
 
     async def fake_sleep(seconds: float) -> None:
         sleeps.append(seconds)
 
-    monkeypatch.setattr(observer_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(guard_module.asyncio, "sleep", fake_sleep)
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, text=_li_text("company_acme_jsonld.html"))

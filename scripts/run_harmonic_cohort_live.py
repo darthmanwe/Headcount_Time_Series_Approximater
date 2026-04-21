@@ -200,8 +200,15 @@ async def _collect_anchors_scoped(
     companies: list[Any],
     *,
     mode: str,
+    rate_guard: Any | None = None,
 ) -> dict[str, object]:
-    """Dispatch the full public-source observer stack against a scoped company list."""
+    """Dispatch the full public-source observer stack against a scoped company list.
+
+    ``rate_guard`` is an optional shared :class:`LinkedInRateGuard`.
+    When provided, the LinkedIn observer adopts it instead of building
+    a private one, so slug-backfill and observer requests share a
+    single budget / breaker / cooldown clock for the whole run.
+    """
     from headcount.config import get_settings
     from headcount.ingest.collect import (
         collect_anchors as _collect_anchors,
@@ -229,7 +236,7 @@ async def _collect_anchors_scoped(
     if mode in {"live-safe", "live-full"}:
         adapters.append(CompanyWebObserver())
     if mode == "live-full":
-        adapters.append(LinkedInPublicObserver())
+        adapters.append(LinkedInPublicObserver(rate_guard=rate_guard))
     result = await _collect_anchors(
         session,
         adapters=adapters,  # type: ignore[arg-type]
@@ -473,6 +480,49 @@ def _resolve_harmonic_cohort(
     return matched, lookup, unmatched
 
 
+def _parse_cohort_slice(spec: str) -> tuple[int, int]:
+    """Parse ``--cohort-slice N/M`` into validated integers.
+
+    Raises :class:`ValueError` on any malformed or out-of-range input.
+    Kept module-level so cohort sharding can be unit-tested without
+    bringing the whole runner along.
+    """
+
+    try:
+        shard_str, total_str = spec.split("/", 1)
+        shard = int(shard_str)
+        total = int(total_str)
+    except (ValueError, AttributeError) as exc:
+        raise ValueError(
+            f"--cohort-slice must look like 'N/M', got {spec!r}"
+        ) from exc
+    if shard < 1 or total < 1 or shard > total:
+        raise ValueError(f"--cohort-slice out of range: {spec!r}")
+    return shard, total
+
+
+def _apply_cohort_slice(
+    companies: list[Any], spec: str
+) -> tuple[list[Any], dict[str, Any]]:
+    """Return the requested shard of ``companies`` plus a meta dict.
+
+    The companies are sorted by canonical name (with id as tiebreaker)
+    before slicing so the same ``N/M`` produces the same subset across
+    runs - a hard requirement for multi-day production runs that need
+    to resume on the same row of the workbook.
+    """
+
+    shard, total = _parse_cohort_slice(spec)
+    ordered = sorted(companies, key=lambda c: (c.canonical_name or c.id))
+    sliced = [c for i, c in enumerate(ordered) if (i % total) + 1 == shard]
+    return sliced, {
+        "shard": shard,
+        "total": total,
+        "in_shard": len(sliced),
+        "skipped": len(ordered) - len(sliced),
+    }
+
+
 def _main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -492,6 +542,26 @@ def _main(argv: list[str]) -> int:
         "--as-of",
         default=None,
         help="Reference month for current/6m/1y (defaults to 2026-04).",
+    )
+    parser.add_argument(
+        "--cohort-slice",
+        default=None,
+        help=(
+            "Restrict the cohort to shard N of M (1-indexed, e.g. 1/4)."
+            " Use to spread a 250-2000 company batch across multiple"
+            " process runs or days while keeping the LinkedIn budget low."
+        ),
+    )
+    parser.add_argument(
+        "--retry-breaker-skips",
+        action="store_true",
+        help=(
+            "After the first pass, sleep through the LinkedIn breaker"
+            " cooldown and re-collect anchors only for companies parked"
+            " by a circuit-open short-circuit. Recommended for"
+            " unattended multi-hour runs; off by default for tight"
+            " local feedback loops."
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -515,6 +585,7 @@ def _main(argv: list[str]) -> int:
     from headcount.ingest.seeds import import_candidates, load_benchmarks
     from headcount.parsers import merge_events, promote_benchmark_events
     from headcount.resolution import resolve_candidates
+    from headcount.ingest.linkedin_guard import LinkedInRateGuard
     from headcount.resolution.linkedin_resolver import backfill_linkedin_slugs
     from headcount.resolution.resolver import _backfill_benchmark_links
 
@@ -585,13 +656,36 @@ def _main(argv: list[str]) -> int:
                 message="Harmonic target not resolved to a canonical company",
                 company=name,
             )
+        # --- Optional: shard the cohort ---
+        # ``--cohort-slice 2/4`` keeps only the second of four equal
+        # slices. The slice is taken AFTER deterministic name-sort by
+        # ``_resolve_harmonic_cohort`` so the same N/M produces the
+        # same set across runs.
+        slice_meta: dict[str, Any] | None = None
+        if args.cohort_slice:
+            try:
+                companies, slice_meta = _apply_cohort_slice(
+                    companies, args.cohort_slice
+                )
+            except ValueError as exc:
+                raise SystemExit(str(exc)) from exc
+
         summary["stages"]["pick_cohort"] = {
             "harmonic_targets": len(harmonic_targets),
             "resolved_companies": len(companies),
             "unmatched": unmatched,
             "elapsed_ms": int((time.time() - t0) * 1000),
         }
+        if slice_meta is not None:
+            summary["stages"]["pick_cohort"]["cohort_slice"] = slice_meta
         company_ids = [c.id for c in companies]
+
+        # --- Stage 4.4: shared LinkedIn rate guard ---
+        # One guard for the entire run so resolver + observer share a
+        # single budget, breaker, jitter clock and cooldown timer.
+        # Without this the resolver alone can exhaust the budget on slug
+        # discovery before the observer ever runs.
+        rate_guard = LinkedInRateGuard.from_settings()
 
         # --- Stage 4.5: LinkedIn slug backfill (BUG-A) ---
         # Seed workbook has no LinkedIn column, so the public observer
@@ -607,7 +701,10 @@ def _main(argv: list[str]) -> int:
                     transport=None,
                 )
                 slug_stats = backfill_linkedin_slugs(
-                    session, company_ids=company_ids, http=slug_http
+                    session,
+                    company_ids=company_ids,
+                    http=slug_http,
+                    rate_guard=rate_guard,
                 )
                 summary["stages"]["linkedin_slug_backfill"] = {
                     **slug_stats,
@@ -637,7 +734,9 @@ def _main(argv: list[str]) -> int:
         t0 = time.time()
         try:
             anchor_summary = asyncio.run(
-                _collect_anchors_scoped(session, companies, mode=args.mode)
+                _collect_anchors_scoped(
+                    session, companies, mode=args.mode, rate_guard=rate_guard
+                )
             )
             summary["stages"]["collect_anchors"] = {
                 **dict(anchor_summary),
@@ -658,6 +757,64 @@ def _main(argv: list[str]) -> int:
                 "error": str(exc),
                 "elapsed_ms": int((time.time() - t0) * 1000),
             }
+
+        # --- Stage 5.5: optional breaker-recovery pass ---
+        # If the LinkedIn breaker tripped during stage 5 we now have a
+        # list of company ids parked in the guard. Behind a flag we
+        # sleep through the cooldown and re-collect anchors only for
+        # those companies so a 250-company production run does not
+        # lose its long tail to a single 999 burst. Off by default so
+        # interactive cohort runs stay snappy.
+        deferred = rate_guard.drain_deferred()
+        retry_meta: dict[str, Any] = {
+            "deferred_count": len(deferred),
+            "trips_observed": rate_guard.trip_count,
+        }
+        if deferred and args.retry_breaker_skips and args.mode == "live-full":
+            cooldown = max(1.0, rate_guard.cooldown_remaining() + 5.0)
+            retry_meta["cooldown_slept_seconds"] = cooldown
+            print(
+                f"[breaker-recovery] sleeping {cooldown:.1f}s for cooldown,"
+                f" then retrying {len(deferred)} deferred companies",
+                flush=True,
+            )
+            time.sleep(cooldown)
+            # is_circuit_open() now re-arms the guard automatically.
+            assert not rate_guard.is_circuit_open(), (
+                "guard should be re-armed after sleeping cooldown"
+            )
+            retry_companies = [c for c in companies if c.id in set(deferred)]
+            t1 = time.time()
+            try:
+                retry_summary = asyncio.run(
+                    _collect_anchors_scoped(
+                        session,
+                        retry_companies,
+                        mode=args.mode,
+                        rate_guard=rate_guard,
+                    )
+                )
+                retry_meta["retry_summary"] = dict(retry_summary)
+                retry_meta["status"] = "ok"
+            except Exception as exc:
+                ctx.add(
+                    stage="collect_anchors_retry",
+                    severity="warn",
+                    message="breaker-recovery retry pass raised",
+                    detail={"error": str(exc)},
+                )
+                retry_meta["status"] = "error"
+                retry_meta["error"] = str(exc)
+            retry_meta["elapsed_ms"] = int((time.time() - t1) * 1000)
+        elif deferred:
+            retry_meta["status"] = "skipped_no_flag"
+            retry_meta["deferred_company_ids"] = deferred
+        else:
+            retry_meta["status"] = "no_deferred"
+        summary["stages"]["collect_anchors_retry"] = retry_meta
+        summary["stages"]["collect_anchors_retry"]["linkedin_requests_made"] = (
+            rate_guard.requests_made
+        )
 
         # --- Stage 6: collect employment (OCR only; no benchmark promotion
         #     because we haven't loaded any benchmark rows yet) ---

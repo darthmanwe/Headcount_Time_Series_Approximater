@@ -33,12 +33,10 @@ Hard constraints (enforced in code, not conventions)
 
 from __future__ import annotations
 
-import asyncio
 import random
 from datetime import date
 from typing import Any
 
-from headcount.config.settings import get_settings
 from headcount.db.enums import (
     AnchorType,
     HeadcountValueKind,
@@ -54,6 +52,7 @@ from headcount.ingest.base import (
     FetchContext,
     RawAnchorSignal,
 )
+from headcount.ingest.linkedin_guard import LinkedInRateGuard
 from headcount.parsers.anchors import (
     LINKEDIN_PUBLIC_PARSER_VERSION,
     LinkedInJsonLdEmployees,
@@ -104,75 +103,59 @@ class LinkedInPublicObserver(AnchorSourceAdapter):
         daily_request_budget: int | None = None,
         jitter_ms_range: tuple[int, int] | None = None,
         rng: random.Random | None = None,
+        rate_guard: LinkedInRateGuard | None = None,
     ) -> None:
         super().__init__()
-        settings = get_settings()
         self._anchor_month = anchor_month
 
-        if circuit_threshold is None:
-            circuit_threshold = settings.linkedin_public_circuit_breaker_n
-        self._circuit_threshold = max(1, int(circuit_threshold))
-
-        if daily_request_budget is None:
-            daily_request_budget = settings.linkedin_public_max_requests_per_run
-        # Budget 0 means "disabled" for tests and for the cases where
-        # the caller enforces its own cap upstream.
-        self._daily_request_budget = max(0, int(daily_request_budget))
-
-        if jitter_ms_range is None:
-            jitter_ms_range = (
-                settings.linkedin_public_request_jitter_ms_min,
-                settings.linkedin_public_request_jitter_ms_max,
+        # When a shared guard is injected (cohort runs, multi-caller setups)
+        # we use it as-is so the resolver and observer share one budget,
+        # one streak and one cooldown clock. When omitted (unit tests,
+        # one-off invocations) we build a private guard from settings,
+        # honouring any per-call overrides for backwards compatibility.
+        if rate_guard is not None:
+            self._guard = rate_guard
+            self._owns_guard = False
+        else:
+            self._guard = LinkedInRateGuard.from_settings(
+                circuit_threshold=circuit_threshold,
+                daily_request_budget=daily_request_budget,
+                jitter_ms=jitter_ms_range,
+                rng=rng,
             )
-        lo, hi = jitter_ms_range
-        if hi < lo:
-            lo, hi = hi, lo
-        self._jitter_ms = (max(0, int(lo)), max(0, int(hi)))
+            self._owns_guard = True
 
-        self._rng = rng if rng is not None else random.Random()
-        self._consecutive_gates = 0
-        self._circuit_open = False
-        self._requests_made = 0
-        self._last_was_network = False
+    @property
+    def rate_guard(self) -> LinkedInRateGuard:
+        """The guard backing this observer (shared or private)."""
+
+        return self._guard
 
     @property
     def consecutive_gates(self) -> int:
         """Number of successive gated primary fetches since last success."""
 
-        return self._consecutive_gates
+        return self._guard.consecutive_gates
 
     @property
     def circuit_open(self) -> bool:
-        """True once the streak hit the configured threshold for this run."""
+        """True once the breaker is open and still inside its cooldown."""
 
-        return self._circuit_open
+        return self._guard.is_circuit_open()
 
     @property
     def requests_made(self) -> int:
-        """Count of outbound HTTP requests this observer has issued."""
+        """Count of outbound HTTP requests issued through this guard."""
 
-        return self._requests_made
+        return self._guard.requests_made
 
     def _budget_exhausted(self) -> bool:
-        if self._daily_request_budget <= 0:
-            return False
-        return self._requests_made >= self._daily_request_budget
+        return self._guard.is_budget_exhausted()
 
     async def _apply_jitter(self) -> None:
-        """Sleep a human-scale random amount before the next HTTP call.
+        """Sleep a human-scale random amount before the next HTTP call."""
 
-        Lever L3: predictable ~1 request/second cadence is itself a
-        bot tell. We insert uniform jitter between ``_jitter_ms`` bounds
-        so adjacent requests look like a person tabbing around rather
-        than a for-loop.
-        """
-
-        lo, hi = self._jitter_ms
-        if hi <= 0:
-            return
-        delay_ms = self._rng.randint(lo, hi) if hi > lo else lo
-        if delay_ms > 0:
-            await asyncio.sleep(delay_ms / 1000.0)
+        await self._guard.before_request()
 
     async def fetch_current_anchor(
         self,
@@ -191,17 +174,20 @@ class LinkedInPublicObserver(AnchorSourceAdapter):
             )
             return []
 
-        if self._circuit_open:
-            # Lever L4: once tripped, skip LinkedIn for every subsequent
-            # company in this run. We avoid the HTTP round-trip entirely
-            # instead of sending more requests that are statistically
-            # certain to be 999-walled, which is the exact pattern
-            # LinkedIn uses to extend the ban window.
+        if self._guard.is_circuit_open():
+            # Lever L4: while the breaker is open we skip LinkedIn
+            # entirely instead of sending requests that are statistically
+            # certain to be 999-walled (the exact pattern LinkedIn uses
+            # to extend the ban window). The company id is parked in the
+            # guard's deferred queue so the orchestrator can replay it
+            # after the cooldown window elapses.
             linkedin_gate_total.labels(reason="circuit_open").inc()
+            self._guard.defer_company(target.company_id)
             _log.warning(
                 "linkedin_public_circuit_open_skip",
                 company_id=target.company_id,
                 slug=slug,
+                cooldown_remaining=self._guard.cooldown_remaining(),
             )
             return []
 
@@ -215,8 +201,8 @@ class LinkedInPublicObserver(AnchorSourceAdapter):
                 "linkedin_public_budget_exhausted",
                 company_id=target.company_id,
                 slug=slug,
-                budget=self._daily_request_budget,
-                requests_made=self._requests_made,
+                budget=self._guard.daily_request_budget,
+                requests_made=self._guard.requests_made,
             )
             return []
 
@@ -322,25 +308,12 @@ class LinkedInPublicObserver(AnchorSourceAdapter):
     def _note_primary_gate(self) -> None:
         """Bump the gate streak and trip the breaker when it saturates."""
 
-        self._consecutive_gates += 1
-        if self._consecutive_gates >= self._circuit_threshold and not self._circuit_open:
-            self._circuit_open = True
-            linkedin_gate_total.labels(reason="circuit_tripped").inc()
-            _log.error(
-                "linkedin_public_circuit_tripped",
-                threshold=self._circuit_threshold,
-                streak=self._consecutive_gates,
-            )
+        self._guard.note_gate()
 
     def _note_success(self) -> None:
         """Reset the breaker once we actually parsed a signal."""
 
-        if self._consecutive_gates:
-            _log.info(
-                "linkedin_public_circuit_streak_reset",
-                previous_streak=self._consecutive_gates,
-            )
-        self._consecutive_gates = 0
+        self._guard.note_success()
 
     async def _fetch(
         self,
@@ -370,11 +343,10 @@ class LinkedInPublicObserver(AnchorSourceAdapter):
         # CachedResponse with from_cache=True when served locally. The
         # jitter only fires once we know the *previous* request went to
         # the network, so a run made entirely of cache hits stays fast.
-        if self._budget_exhausted():
+        if self._guard.is_budget_exhausted():
             linkedin_gate_total.labels(reason="budget_exhausted").inc()
             raise AdapterGatedError(f"budget_exhausted on {url}")
-        if self._last_was_network:
-            await self._apply_jitter()
+        await self._guard.before_request()
         try:
             response = await context.http.get(self.source_name, url)
         except Exception as exc:  # pragma: no cover - network guard
@@ -382,10 +354,9 @@ class LinkedInPublicObserver(AnchorSourceAdapter):
                 f"linkedin_public {purpose} fetch failed for {url}: {exc!r}"
             ) from exc
 
-        is_network = not getattr(response, "from_cache", False)
-        self._last_was_network = is_network
-        if is_network:
-            self._requests_made += 1
+        self._guard.record_response(
+            from_cache=bool(getattr(response, "from_cache", False))
+        )
 
         status_gate = looks_gated_linkedin_status(response.status_code)
         if status_gate is not None:

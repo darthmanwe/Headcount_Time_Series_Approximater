@@ -12,14 +12,40 @@ HTTP probe returns 200 and the page title fuzzily matches the target.
 On auth-wall / 429 / 403 responses we treat the candidate as ``gated``
 rather than wrongly accepting or rejecting it, so re-runs stay cheap.
 
+Bot-defence integration
+-----------------------
+The resolver shares a :class:`LinkedInRateGuard` with the public
+observer when the orchestrator passes one in. That gives a single
+process one daily LinkedIn budget, one jitter clock, and one circuit
+breaker across resolver + observer. When called without a guard (unit
+tests, ad-hoc backfills) it constructs a private guard from settings.
+
+Disambiguation
+--------------
+"Arable" (an agritech company) and "Arable Consulting" (an advisory
+firm) both look like reasonable matches for the ``arable`` slug under
+the original token-overlap test. The resolver layers extra checks on
+top of :func:`title_matches_name` to reject these single-token
+false-positives:
+
+- If the target name is a *single* significant token and the title
+  introduces a generic business qualifier ("consulting", "partners",
+  "advisors", ...), the candidate is rejected.
+- If a canonical domain is provided and it appears verbatim in the
+  body, that is treated as a strong positive that overrides the
+  qualifier veto - because the LinkedIn page itself is pointing at
+  the same web property we're targeting.
+
 Public API
 ----------
 - ``slug_candidates(name, domain)`` - ordered slug candidates to try.
-- ``resolve_linkedin_slug(company, *, http)`` - returns the first
-  verified ``LinkedInSlugResult`` or ``None``.
-- ``backfill_linkedin_slugs(session, *, company_ids, http)`` - iterate
-  over companies missing ``linkedin_company_url`` and persist anything
-  the resolver can verify.
+- ``resolve_linkedin_slug(company, *, http, rate_guard=None,
+  company_id=None)`` - returns the first verified
+  ``LinkedInSlugResult`` or ``None``.
+- ``backfill_linkedin_slugs(session, *, company_ids, http,
+  rate_guard=None)`` - iterate over companies missing
+  ``linkedin_company_url`` and persist anything the resolver can
+  verify.
 """
 
 from __future__ import annotations
@@ -34,12 +60,38 @@ from sqlalchemy.orm import Session
 
 from headcount.db.enums import SourceName
 from headcount.ingest.http import CachedResponse, HttpClient
+from headcount.ingest.linkedin_guard import LinkedInRateGuard
 from headcount.models.company import Company
 from headcount.utils.logging import get_logger
+from headcount.utils.metrics import linkedin_gate_total
 
 _log = get_logger("headcount.resolution.linkedin_resolver")
 
 COMPANY_URL_TEMPLATE = "https://www.linkedin.com/company/{slug}/"
+
+# Generic business-type tokens that, when they appear in a LinkedIn
+# title alongside a single-token target name, almost always indicate a
+# different organisation that just happens to own the slug. The list is
+# deliberately narrow (no "labs"/"studio" because plenty of real
+# matches use those).
+_AMBIGUOUS_QUALIFIERS: frozenset[str] = frozenset(
+    {
+        "consulting",
+        "consultants",
+        "consultancy",
+        "advisors",
+        "advisory",
+        "partners",
+        "associates",
+        "holdings",
+        "group",
+        "ventures",
+        "capital",
+        "agency",
+        "services",
+        "solutions",
+    }
+)
 
 _TITLE_RE = re.compile(
     r"<title[^>]*>(?P<title>.*?)</title>",
@@ -159,6 +211,57 @@ def title_matches_name(title: str, name: str) -> bool:
     return any(tok in title_tokens for tok in significant)
 
 
+def _domain_appears_in_body(body: str, domain: str | None) -> bool:
+    """True if ``domain`` is mentioned anywhere in the response body.
+
+    LinkedIn's public company page links the company website (often
+    multiple times: nav, about copy, JSON-LD ``url`` field). A literal
+    domain match is the strongest disambiguation signal we get without
+    parsing JSON-LD here, and it costs almost nothing.
+    """
+
+    if not domain or not body:
+        return False
+    return domain.lower() in body.lower()
+
+
+def disambiguate_match(
+    *,
+    title: str,
+    name: str,
+    domain: str | None,
+    body: str,
+) -> tuple[bool, str]:
+    """Stricter verifier returning ``(accepted, reason)``.
+
+    Layered on top of :func:`title_matches_name` to catch single-token
+    false positives like ``arable`` -> "Arable Consulting". Always
+    accepts when the canonical domain literally appears in the body,
+    since at that point the LinkedIn page is unambiguously pointing at
+    the same web property we're targeting.
+    """
+
+    if not title_matches_name(title, name):
+        return False, "no_token_overlap"
+
+    if _domain_appears_in_body(body, domain):
+        return True, "domain_in_body"
+
+    stripped = _strip_linkedin_suffix(title)
+    title_tokens = _name_tokens(stripped)
+    name_tokens = _name_tokens(name)
+    sig_name = [t for t in name_tokens if len(t) >= 3] or name_tokens
+    sig_title = [t for t in title_tokens if len(t) >= 3] or title_tokens
+
+    # Tokens the title introduces that are NOT in the target name.
+    extras = [t for t in sig_title if t not in set(sig_name)]
+    if len(sig_name) == 1 and any(extra in _AMBIGUOUS_QUALIFIERS for extra in extras):
+        offending = next(e for e in extras if e in _AMBIGUOUS_QUALIFIERS)
+        return False, f"ambiguous_qualifier:{offending}"
+
+    return True, "ok"
+
+
 def _classify(response: CachedResponse) -> str:
     status = response.status_code
     if status == 200:
@@ -171,24 +274,59 @@ def _classify(response: CachedResponse) -> str:
 
 
 async def _probe(
-    http: HttpClient, *, slug: str, target_name: str, method: str
+    http: HttpClient,
+    *,
+    slug: str,
+    target_name: str,
+    target_domain: str | None,
+    method: str,
+    guard: LinkedInRateGuard,
 ) -> tuple[LinkedInSlugResult | None, str]:
     url = COMPANY_URL_TEMPLATE.format(slug=slug)
+
+    if guard.is_budget_exhausted():
+        # Self-imposed cap. Don't burn the rest of the budget on slug
+        # discovery; the observer is the higher-value caller.
+        linkedin_gate_total.labels(reason="budget_exhausted").inc()
+        return None, "budget_exhausted"
+
+    await guard.before_request()
     try:
         response = await http.get(SourceName.linkedin_public, url)
     except Exception as exc:  # pragma: no cover - defensive
         return None, f"fetch_error:{exc!r}"
 
+    guard.record_response(from_cache=bool(getattr(response, "from_cache", False)))
+
     verdict = _classify(response)
     if verdict != "ok":
+        if verdict == "gated":
+            # Status-level gate (999 / 429 / 403 / ...). Feed the breaker
+            # so a streak across the slug-discovery phase doesn't burn
+            # the observer's first attempts.
+            tripped = guard.note_gate()
+            if tripped:
+                _log.error(
+                    "linkedin_resolver_circuit_tripped",
+                    threshold=guard.circuit_threshold,
+                    streak=guard.consecutive_gates,
+                )
         return None, verdict
 
     body = response.text or ""
     title = _extract_title(body)
     if title is None:
         return None, "no_title"
-    if not title_matches_name(title, target_name):
-        return None, f"title_mismatch:{title!r}"
+
+    accepted, reason = disambiguate_match(
+        title=title, name=target_name, domain=target_domain, body=body
+    )
+    if not accepted:
+        return None, f"verify_rejected:{reason}:{title!r}"
+
+    # A verified hit is treated as a "success" for the breaker so the
+    # streak resets cleanly when slug discovery starts working again.
+    guard.note_success()
 
     confidence = {
         "domain_label": 0.85,
@@ -208,15 +346,57 @@ async def resolve_linkedin_slug(
     name: str,
     domain: str | None,
     http: HttpClient,
+    rate_guard: LinkedInRateGuard | None = None,
+    company_id: str | None = None,
 ) -> LinkedInSlugResult | None:
-    """Return the first candidate slug whose LinkedIn page verifies, or None."""
+    """Return the first candidate slug whose LinkedIn page verifies, or None.
+
+    ``rate_guard`` is optional: when omitted, the resolver builds a
+    private guard from settings, preserving the historical ad-hoc
+    callsite behaviour. Cohort runs always pass a shared guard so that
+    one daily LinkedIn budget covers both slug discovery and the
+    observer.
+
+    ``company_id`` is used to park the company in ``rate_guard`` when
+    the breaker is open, so the orchestrator can replay it after the
+    cooldown elapses.
+    """
+
+    guard = rate_guard if rate_guard is not None else LinkedInRateGuard.from_settings()
+
+    if guard.is_circuit_open():
+        if company_id:
+            guard.defer_company(company_id)
+        linkedin_gate_total.labels(reason="circuit_open").inc()
+        _log.warning(
+            "linkedin_resolver_circuit_open_skip",
+            name=name,
+            domain=domain,
+            company_id=company_id,
+            cooldown_remaining=guard.cooldown_remaining(),
+        )
+        return None
 
     attempts: list[tuple[str, str, str]] = []
-    for slug, method in slug_candidates(name, domain):
+    seen_slugs: set[str] = set()
+
+    async def _try_slug(slug: str, method: str) -> LinkedInSlugResult | None:
+        if slug in seen_slugs:
+            return None
+        seen_slugs.add(slug)
         result, verdict = await _probe(
-            http, slug=slug, target_name=name, method=method
+            http,
+            slug=slug,
+            target_name=name,
+            target_domain=domain,
+            method=method,
+            guard=guard,
         )
         attempts.append((slug, method, verdict))
+        return result
+
+    for slug, method in slug_candidates(name, domain):
+        result = await _try_slug(slug, method)
         if result is not None:
             _log.info(
                 "linkedin_slug_resolved",
@@ -228,6 +408,48 @@ async def resolve_linkedin_slug(
                 attempts=attempts,
             )
             return result
+        if guard.is_circuit_open():
+            if company_id:
+                guard.defer_company(company_id)
+            _log.warning(
+                "linkedin_resolver_circuit_tripped_mid_resolve",
+                name=name,
+                domain=domain,
+                attempts=attempts,
+            )
+            return None
+
+    # Lever L6: heuristic candidates exhausted. Ask Bing.
+    # Bing is queried at most once per company, on a different host
+    # with a friendlier policy. Discovered slugs go through the same
+    # ``_probe`` path so they pay the same disambiguation + breaker
+    # checks heuristic candidates do.
+    if not guard.is_circuit_open():
+        from headcount.resolution.bing_slug import fetch_bing_slug_candidates
+
+        try:
+            bing_slugs = await fetch_bing_slug_candidates(
+                name=name, domain=domain, http=http
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            bing_slugs = []
+            attempts.append(("(bing)", "bing_serp", f"fetch_error:{exc!r}"))
+        for slug in bing_slugs:
+            result = await _try_slug(slug, "bing_serp")
+            if result is not None:
+                _log.info(
+                    "linkedin_slug_resolved_via_bing",
+                    name=name,
+                    domain=domain,
+                    slug=result.slug,
+                    title=result.title,
+                    attempts=attempts,
+                )
+                return result
+            if guard.is_circuit_open():
+                if company_id:
+                    guard.defer_company(company_id)
+                break
 
     _log.info(
         "linkedin_slug_unresolved",
@@ -243,6 +465,7 @@ def backfill_linkedin_slugs(
     *,
     company_ids: Iterable[str] | None,
     http: HttpClient,
+    rate_guard: LinkedInRateGuard | None = None,
 ) -> dict[str, int]:
     """Populate ``Company.linkedin_company_url`` for companies missing it.
 
@@ -251,12 +474,21 @@ def backfill_linkedin_slugs(
     enforces per-source concurrency and caching so re-running over the
     same workstation is essentially free until TTL rolls.
 
-    Returns per-company counts: ``scanned``, ``resolved``, ``unresolved``.
+    Returns per-company counts: ``scanned``, ``resolved``, ``unresolved``,
+    plus ``deferred`` for companies parked because the breaker was open.
     """
 
     import asyncio
 
-    stats = {"scanned": 0, "resolved": 0, "unresolved": 0, "skipped": 0}
+    guard = rate_guard if rate_guard is not None else LinkedInRateGuard.from_settings()
+
+    stats = {
+        "scanned": 0,
+        "resolved": 0,
+        "unresolved": 0,
+        "skipped": 0,
+        "deferred": 0,
+    }
 
     stmt = select(Company).where(Company.linkedin_company_url.is_(None))
     if company_ids is not None:
@@ -273,13 +505,19 @@ def backfill_linkedin_slugs(
                 if not company.canonical_name and not company.canonical_domain:
                     stats["skipped"] += 1
                     continue
+                deferred_before = len(guard.deferred_companies)
                 result = await resolve_linkedin_slug(
                     name=company.canonical_name,
                     domain=company.canonical_domain,
                     http=http,
+                    rate_guard=guard,
+                    company_id=company.id,
                 )
                 if result is None:
-                    stats["unresolved"] += 1
+                    if len(guard.deferred_companies) > deferred_before:
+                        stats["deferred"] += 1
+                    else:
+                        stats["unresolved"] += 1
                     continue
                 company.linkedin_company_url = result.url
                 stats["resolved"] += 1

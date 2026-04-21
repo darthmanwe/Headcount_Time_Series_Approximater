@@ -10,8 +10,10 @@ import pytest
 
 from headcount.db.enums import SourceName
 from headcount.ingest.http import FileCache, HttpClient, HttpClientConfig
+from headcount.ingest.linkedin_guard import LinkedInRateGuard
 from headcount.resolution.linkedin_resolver import (
     LinkedInSlugResult,
+    disambiguate_match,
     resolve_linkedin_slug,
     slug_candidates,
     title_matches_name,
@@ -83,14 +85,40 @@ def _make_http(tmp_path: Path, handler) -> HttpClient:
     )
 
 
-def _resolve(http: HttpClient, *, name: str, domain: str | None) -> LinkedInSlugResult | None:
+def _resolve(
+    http: HttpClient,
+    *,
+    name: str,
+    domain: str | None,
+    rate_guard: LinkedInRateGuard | None = None,
+    company_id: str | None = None,
+) -> LinkedInSlugResult | None:
     """Open the client and run the resolver once."""
 
     async def _run() -> LinkedInSlugResult | None:
         async with http:
-            return await resolve_linkedin_slug(name=name, domain=domain, http=http)
+            return await resolve_linkedin_slug(
+                name=name,
+                domain=domain,
+                http=http,
+                rate_guard=rate_guard,
+                company_id=company_id,
+            )
 
     return asyncio.run(_run())
+
+
+def _quiet_guard(**overrides) -> LinkedInRateGuard:
+    """Build a guard with jitter disabled and a generous budget for tests."""
+
+    defaults = {
+        "circuit_threshold": 100,
+        "daily_request_budget": 0,
+        "jitter_ms": (0, 0),
+        "cooldown_seconds": 60.0,
+    }
+    defaults.update(overrides)
+    return LinkedInRateGuard(**defaults)
 
 
 class TestResolveLinkedInSlug:
@@ -167,6 +195,201 @@ class TestResolveLinkedInSlug:
         http = _make_http(tmp_path, handler)
         result = _resolve(http, name="Acme Corp", domain="acme.io")
         assert result is None
+
+
+class TestDisambiguateMatch:
+    """Stricter verifier that catches single-token false positives."""
+
+    def test_accepts_clean_overlap(self) -> None:
+        accepted, reason = disambiguate_match(
+            title="Acme Corp | LinkedIn",
+            name="Acme Corp",
+            domain="acme.io",
+            body="<html>...</html>",
+        )
+        assert accepted is True
+        assert reason in {"ok", "domain_in_body"}
+
+    def test_rejects_arable_consulting_for_arable(self) -> None:
+        # The motivating false positive: target is the agritech "Arable",
+        # but the slug 'arable' on LinkedIn is owned by "Arable Consulting".
+        # Domain hint is NOT mentioned in the body, so the qualifier-veto
+        # must fire.
+        accepted, reason = disambiguate_match(
+            title="Arable Consulting | LinkedIn",
+            name="Arable",
+            domain="arable.com",
+            body="<html><body>About Arable Consulting LLC.</body></html>",
+        )
+        assert accepted is False
+        assert reason.startswith("ambiguous_qualifier")
+
+    def test_domain_in_body_overrides_qualifier_veto(self) -> None:
+        # If the LinkedIn page literally links the target's website, that
+        # IS the same company even if the title carries a qualifier.
+        accepted, reason = disambiguate_match(
+            title="Acme Holdings | LinkedIn",
+            name="Acme",
+            domain="acme.io",
+            body="<html><a href='https://acme.io'>Website</a></html>",
+        )
+        assert accepted is True
+        assert reason == "domain_in_body"
+
+    def test_rejects_no_overlap_at_all(self) -> None:
+        accepted, reason = disambiguate_match(
+            title="Totally Different Company | LinkedIn",
+            name="Acme",
+            domain="acme.io",
+            body="<html></html>",
+        )
+        assert accepted is False
+        assert reason == "no_token_overlap"
+
+    def test_multi_token_name_not_blocked_by_qualifier(self) -> None:
+        # Veto only fires for single-token names. "Acme Bio" + "Acme Bio
+        # Partners" should still match.
+        accepted, _ = disambiguate_match(
+            title="Acme Bio Partners | LinkedIn",
+            name="Acme Bio",
+            domain=None,
+            body="<html></html>",
+        )
+        assert accepted is True
+
+
+class TestResolverWithGuard:
+    """Resolver integration with the shared :class:`LinkedInRateGuard`."""
+
+    def test_circuit_open_short_circuits_without_http(self, tmp_path: Path) -> None:
+        seen_urls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen_urls.append(str(request.url))
+            return httpx.Response(200, text="<title>Acme | LinkedIn</title>")
+
+        guard = _quiet_guard(circuit_threshold=1)
+        # Pre-trip the breaker.
+        guard.note_gate()
+        assert guard.is_circuit_open()
+
+        http = _make_http(tmp_path, handler)
+        result = _resolve(
+            http,
+            name="Acme",
+            domain="acme.io",
+            rate_guard=guard,
+            company_id="c-1",
+        )
+        assert result is None
+        assert seen_urls == [], "no HTTP requests should have been issued"
+        assert "c-1" in guard.deferred_companies
+
+    def test_status_gate_feeds_breaker(self, tmp_path: Path) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(999, text="bot wall")
+
+        guard = _quiet_guard(circuit_threshold=2)
+        http = _make_http(tmp_path, handler)
+        # Two probes per resolve attempt (domain_label + name_slug + name_concat
+        # share the same gated response). The first resolve walks through
+        # all three slug candidates -> 3 gate notes -> breaker trips on
+        # the 2nd note.
+        result = _resolve(
+            http, name="Acme Corp", domain="acme.io", rate_guard=guard
+        )
+        assert result is None
+        assert guard.consecutive_gates >= 2
+        assert guard.is_circuit_open()
+
+    def test_budget_exhausted_short_circuits_probe(self, tmp_path: Path) -> None:
+        seen_urls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen_urls.append(str(request.url))
+            return httpx.Response(200, text="<title>Acme | LinkedIn</title>")
+
+        guard = _quiet_guard()
+        guard.daily_request_budget = 1
+        # Pre-spend the budget so the resolver has to short-circuit on
+        # the very first probe.
+        guard.record_response(from_cache=False)
+        assert guard.is_budget_exhausted()
+
+        http = _make_http(tmp_path, handler)
+        result = _resolve(
+            http, name="Acme Corp", domain="acme.io", rate_guard=guard
+        )
+        assert result is None
+        # Budget cap is LinkedIn-specific; Bing fallback is allowed.
+        from urllib.parse import urlparse
+
+        linkedin_calls = [
+            u
+            for u in seen_urls
+            if (urlparse(u).hostname or "").endswith("linkedin.com")
+        ]
+        assert linkedin_calls == [], (
+            f"budget cap must skip LinkedIn calls, saw {linkedin_calls}"
+        )
+
+    def test_resolver_clears_streak_on_verified_hit(self, tmp_path: Path) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                text="<html><head><title>Acme Corp | LinkedIn</title></head></html>",
+            )
+
+        guard = _quiet_guard(circuit_threshold=5)
+        guard.note_gate()
+        guard.note_gate()
+        assert guard.consecutive_gates == 2
+
+        http = _make_http(tmp_path, handler)
+        result = _resolve(
+            http, name="Acme Corp", domain="acme.io", rate_guard=guard
+        )
+        assert result is not None
+        assert guard.consecutive_gates == 0
+
+
+class TestResolverDisambigInLoop:
+    """End-to-end: a 200 OK with the wrong company is rejected by name."""
+
+    def test_arable_consulting_is_not_arable(self, tmp_path: Path) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                text=(
+                    "<html><head>"
+                    "<title>Arable Consulting | LinkedIn</title>"
+                    "</head><body>About Arable Consulting LLC.</body></html>"
+                ),
+            )
+
+        http = _make_http(tmp_path, handler)
+        result = _resolve(http, name="Arable", domain="arable.com")
+        assert result is None, "disambig should reject the qualifier-titled page"
+
+    def test_arable_with_matching_website_link_accepted(
+        self, tmp_path: Path
+    ) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                text=(
+                    "<html><head>"
+                    "<title>Arable | LinkedIn</title>"
+                    "</head><body>"
+                    "<a href='https://arable.com/about'>Website</a>"
+                    "</body></html>"
+                ),
+            )
+
+        http = _make_http(tmp_path, handler)
+        result = _resolve(http, name="Arable", domain="arable.com")
+        assert result is not None
+        assert result.slug == "arable"
 
 
 if __name__ == "__main__":  # pragma: no cover
