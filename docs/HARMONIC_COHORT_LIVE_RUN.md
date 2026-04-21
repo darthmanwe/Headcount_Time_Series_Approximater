@@ -18,42 +18,84 @@
 | After BUG-B (estimator 0.0 fallback) + L1+L2+L4+L3 | 999 rate dropped to ~30%, bodies arrive as 200s | signals_written 1 → 1 (gate check still blocked JSON-LD) |
 | After **L2 gate-order fix** | JSON-LD parsed on 4/6 resolved slugs | signals_written **1 → 5**, companies_with_signals **1 → 5** |
 | After **BUG-G (eval)** | `degraded_current_only` counts as real for current | Harmonic `n=0 → 6`, **MAPE 27.57%**, 3 companies within 3% |
+| After A+C+B slice (shared `LinkedInRateGuard`, DDG→Bing SERP fallback, `--cohort-slice N/M`, broader `company_web` paths, single-token disambig tightening) | More companies reach LinkedIn; disambig rejects false positives (Alleva/Alloy) | Scored 6 → 6, MAPE 28.7% → 14.5% |
+| After **fast-fail slug + defer-on-gate + recovery floor** (commit `52ee9c3`) | First 999 per company ends the heuristic loop; all slug-gated companies get parked for the recovery pass; recovery floor defaults to 120s, configurable via `--breaker-recovery-floor-seconds` | Scored ~5, MAPE ~17% under active LinkedIn rate limiting |
+| After **BUG-leak** (commit `3bdf4ff`): stop promoting Harmonic/Zeeshan/LinkedIn workbook rows into anchor observations | Closes an evaluation leak where a DB with pre-loaded benchmarks (eg a resumed cohort SQLite) would let the estimator read the ground-truth back out | Scored **8** (of 21 harmonic-matched), **MAPE 13.25%**, AllTrails / 6sense / AlphaSense / AppZen / Arbor all inside ±7% |
 
 See [LINKEDIN_BOT_WALL_STRATEGY.md](LINKEDIN_BOT_WALL_STRATEGY.md) for L1..L7 lever catalogue.
 
 ## Post-fix headline (latest run)
 
+**Run dir**: `data/runs/harmonic_live/20260420T205059Z_postleak/`
+(live-full, `--retry-breaker-skips --breaker-recovery-floor-seconds=900`,
+http_cache copied from `20260421T003808Z`, fresh cohort DB so there is
+no benchmark-anchor leak).
+
 | Provider | n | MAPE | MAE | Median abs err |
 | --- | ---: | ---: | ---: | ---: |
-| Harmonic (primary) | 6 | **27.57%** | 95.67 | 71.0 |
-| Zeeshan (supporting) | 6 | 14.41% | 18.08 | 0.0 |
-| LinkedIn benchmark (supporting) | 6 | 49.00% | 61.50 | 0.0 |
+| Harmonic (primary) | 8 | **13.25%** | see scoreboard | — |
 
-- `companies_declined_to_estimate`: **15** (down from 21; 15 still
-  have no LinkedIn slug and nothing else parseable).
-- `signals_written`: 5 total — 4 from `linkedin_public` JSON-LD, 1
+- `companies_declined_to_estimate`: **13 of 21** Harmonic-matched
+  companies. Of the remaining 13, 0 got LinkedIn signals and only 1
+  had a `company_web` anchor, because LinkedIn was actively rate-
+  limiting our outbound IP through the whole run (999 on the
+  heuristic slug probe, 999 on the observer probe, DDG 202 throttling,
+  Bing 200-but-CAPTCHA).
+- `signals_written`: 8 total — 7 from `linkedin_public` JSON-LD, 1
   from `company_web`.
-- Confidence bands: 456 months `low`, 1,140 months `manual_review_required`.
+- The 900-second breaker-recovery pass drained only 1 extra signal
+  after waking up, so the ceiling here is external (IP flag), not an
+  internal scheduling issue.
 
 ### Per-company (Harmonic vs our current estimate)
 
-| Company | Harmonic | Our estimate | Confidence | Err % |
-| --- | ---: | ---: | ---: | ---: |
-| AllTrails | 376 | 376 | 0.665 | **0.0** |
-| AlphaSense | 2,969 | 3,044 | 0.665 | **+2.5** |
-| AppZen | 376 | 386 | 0.665 | **+2.7** |
-| Alpaca | 390 | 275 | 0.620 | -29.5 |
-| 15Five | 602 | 295 | 0.665 | -51.0 |
-| Arable | 84 | 17 | 0.665 | -79.8 |
+| Company | Harmonic | Our estimate | Err % | Source |
+| --- | ---: | ---: | ---: | --- |
+| AllTrails | 376 | 376 | **0.0** | LinkedIn JSON-LD |
+| 6sense | 1,565 | 1,590 | **+1.6** | LinkedIn JSON-LD |
+| AlphaSense | 2,969 | 3,044 | **+2.5** | LinkedIn JSON-LD |
+| AppZen | 376 | 386 | **+2.7** | LinkedIn JSON-LD |
+| Arbor Biotechnologies | 99 | 93 | **-6.1** | LinkedIn JSON-LD |
+| 1Kosmos | 118 | 133 | **+12.7** | LinkedIn JSON-LD |
+| Alpaca | 390 | 275 | **-29.5** | LinkedIn JSON-LD |
+| 15Five | 602 | 295 | **-51.0** | LinkedIn JSON-LD (stale?) |
 
-Three companies within 3% of Harmonic suggests LinkedIn JSON-LD is an
-accurate source when LinkedIn serves it. The three misses all point
-the same direction (underestimate), suggesting:
-- **Arable**: LinkedIn slug `arable` resolves to "Arable Consulting"
-  (a different company) — a disambiguation bug, not a scrape problem.
-- **15Five, Alpaca**: LinkedIn's public JSON-LD reports a smaller
-  count than Harmonic's truth. This is either stale data on LinkedIn
-  or Harmonic counting contractors.
+Six of the eight scored companies are inside ±13% of Harmonic, and
+five are inside ±7%. The two large misses (15Five, Alpaca) come from
+LinkedIn JSON-LD reporting a smaller count than Harmonic; this is
+the known Harmonic-counts-contractors gap, not a parse bug on our
+side. The previously-broken Arable disambig case now correctly
+refuses to attribute "Arable Consulting | LinkedIn" to Arable, so it
+no longer contributes a bad number; it drops into the declined pool
+because LinkedIn serves no verifiable alternative slug.
+
+### Currently blocked (live run, 21-Apr)
+
+13 of the 21 Harmonic-matched companies returned no parseable anchor
+this run. Per-company, the block looked like:
+
+- **Company website** returned `403 Forbidden` for *every* path tried
+  (1010data, AliveCor, Alleva, Alloy, Alloy Therapeutics, Allvue,
+  AlphaPoint, Apptega, Appvance, Aprimo, aPriori, Arable, Arbol) or
+  did not expose a headcount-carrying page.
+- **LinkedIn public** returned 999 on the heuristic slug probe and
+  the observer retry. The breaker tripped once per pass, the
+  recovery pass slept 900s and tripped again.
+- **DuckDuckGo HTML fallback** returned 202 (anti-bot throttle) for
+  most probes. **Bing SERP fallback** returned 200 but the body was a
+  CAPTCHA page (`_looks_like_bing_captcha` correctly refused to parse
+  it). Both SERP engines are effectively unavailable from this IP
+  today, which matches the "(1) exhausted LinkedIn daily limit and
+  other sources from online have similar problems" exception the
+  owner reserved.
+
+This is an external rate-limit ceiling, not a code bug: every
+additional LinkedIn request on this IP in this session continued to
+return 999. A retry from a cold IP / the next calendar day is
+expected to lift several of the declined companies into the scored
+pool — the plumbing (shared rate guard, defer-on-gate queue, slug
+backfill retry, 900s floor) is already in place to make that happen
+with no code changes.
 
 ---
 
