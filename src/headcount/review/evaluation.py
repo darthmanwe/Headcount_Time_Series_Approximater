@@ -117,30 +117,44 @@ _HEADCOUNT_METRIC_OFFSETS: dict[BenchmarkMetric, int] = {
     BenchmarkMetric.headcount_2y_ago: -24,
 }
 
-# EstimateMethod values that mean "we looked and declined to produce a
-# real number." The stored ``estimated_headcount`` on these rows is a
-# placeholder (0.0 for no-anchor-at-all segments, or the anchor point
-# copied forward for anchor_month_has_no_profiles) and should never be
-# compared against a benchmark as if it were a genuine estimate.
-_DECLINED_METHODS: frozenset[EstimateMethod] = frozenset(
+# EstimateMethod values that mean "we looked and produced nothing
+# usable." The stored ``estimated_headcount`` is 0.0 and must never be
+# scored against a benchmark.
+_FULLY_DECLINED_METHODS: frozenset[EstimateMethod] = frozenset(
     {
         EstimateMethod.suppressed_low_sample,
+    }
+)
+
+# EstimateMethod values where the *anchor month* carries a real signal
+# (e.g. a LinkedIn JSON-LD numberOfEmployees) but every other month in
+# the series is that same anchor value copied forward because we lack
+# the historical employment coverage to interpolate. For the current-
+# month metric we should evaluate these rows; for any historical metric
+# (6m/1y/2y ago, growth windows) we must skip them.
+_ANCHOR_ONLY_METHODS: frozenset[EstimateMethod] = frozenset(
+    {
         EstimateMethod.degraded_current_only,
     }
 )
 
 
-def _estimate_declined(est: MonthlyEstimate) -> bool:
+def _estimate_declined(
+    est: MonthlyEstimate, *, horizon: str = "historical"
+) -> bool:
     """True when the pipeline effectively declined to estimate this month.
 
-    Covers the ``no_anchor_in_segment`` case (zero real signal) and
-    ``anchor_month_has_no_profiles`` (anchor exists but coverage is so
-    low we fall back to the anchor point). In both cases the numeric
-    value in ``estimated_headcount`` is a placeholder, not an estimate.
+    ``horizon`` tells the helper whether the caller is evaluating the
+    current-month metric (``"current"``) or a historical one
+    (``"historical"``). ``degraded_current_only`` rows are treated as
+    real for the current month (that's the anchor) but declined for
+    every historical horizon (those are the copied-forward placeholders).
     """
 
-    if est.method in _DECLINED_METHODS:
+    if est.method in _FULLY_DECLINED_METHODS:
         return True
+    if est.method in _ANCHOR_ONLY_METHODS:
+        return horizon != "current"
     return est.confidence_band is ConfidenceBand.manual_review_required
 
 
@@ -564,9 +578,13 @@ def evaluate_against_benchmarks(
             confidence_bands[est.confidence_band.value] = (
                 confidence_bands.get(est.confidence_band.value, 0) + 1
             )
-        # A company "declined" when every month in its latest version
-        # is a placeholder produced without a real anchor.
-        if all(_estimate_declined(est) for est in monthly.values()):
+        # A company "declined" when even the anchor month (current)
+        # has no real signal. ``degraded_current_only`` rows count as
+        # partially-declined rather than fully-declined because the
+        # anchor month itself carries a real value.
+        if all(
+            _estimate_declined(est, horizon="current") for est in monthly.values()
+        ):
             companies_declined += 1
 
     companies_with_benchmark = sum(1 for cid in scope_set if benchmarks_by_company.get(cid))
@@ -716,7 +734,10 @@ def _score_one_benchmark_row(
         if est is None:
             return
         bucket = accuracy.setdefault(provider, {}).setdefault(metric.value, MetricBucket())
-        if _estimate_declined(est):
+        horizon = (
+            "current" if metric is BenchmarkMetric.headcount_current else "historical"
+        )
+        if _estimate_declined(est, horizon=horizon):
             # Pipeline declined to estimate this month - the stored
             # ``estimated_headcount`` is a placeholder, not a guess. Count
             # it as a coverage gap and move on; rolling it into MAPE

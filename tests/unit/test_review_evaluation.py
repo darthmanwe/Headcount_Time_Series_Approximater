@@ -643,8 +643,14 @@ def test_evaluate_skips_declined_estimates(session: Session) -> None:
     assert board.headline_mape() == 0.0
 
 
-def test_evaluate_degraded_current_only_is_also_declined(session: Session) -> None:
-    """``degraded_current_only`` is a weak placeholder, not an estimate."""
+def test_evaluate_degraded_current_only_counts_for_current_metric(
+    session: Session,
+) -> None:
+    """``degraded_current_only`` carries a real anchor at the current
+    month (the LinkedIn JSON-LD value, for instance). The historical
+    horizons are copied-forward placeholders, so those skip as declined,
+    but ``headcount_current`` must be evaluated.
+    """
 
     co = _seed_company(session, "DegradedCo")
     ver = _seed_estimate_version(session, co)
@@ -659,6 +665,17 @@ def test_evaluate_degraded_current_only_is_also_declined(session: Session) -> No
         suppression_reason="anchor_month_has_no_profiles",
         needs_review=True,
     )
+    _seed_estimate_row(
+        session,
+        company=co,
+        version_id=ver.id,
+        month=date(2025, 10, 1),
+        value_point=200.0,
+        band=ConfidenceBand.low,
+        method=EstimateMethod.degraded_current_only,
+        suppression_reason="anchor_month_has_no_profiles",
+        needs_review=True,
+    )
     _seed_benchmark(
         session,
         company=co,
@@ -667,12 +684,25 @@ def test_evaluate_degraded_current_only_is_also_declined(session: Session) -> No
         as_of=date(2026, 4, 1),
         value_point=800.0,
     )
+    _seed_benchmark(
+        session,
+        company=co,
+        provider=BenchmarkProvider.harmonic,
+        metric=BenchmarkMetric.headcount_6m_ago,
+        as_of=date(2025, 10, 1),
+        value_point=700.0,
+    )
     session.flush()
 
     board = evaluate_against_benchmarks(session, as_of_month=date(2026, 4, 1))
 
-    assert board.companies_declined_to_estimate == 1
-    harm = board.accuracy["harmonic"]["headcount_current"]
-    assert harm["n"] == 0
-    assert harm["skipped_declined"] == 1
-    assert board.headline_mape() is None
+    # Company is not fully declined: it produced a real anchor value.
+    assert board.companies_declined_to_estimate == 0
+    current = board.accuracy["harmonic"]["headcount_current"]
+    assert current["n"] == 1
+    assert current["skipped_declined"] == 0
+    # Historical horizon is still skipped because that row is a
+    # copied-forward placeholder, not a real estimate.
+    six_m = board.accuracy["harmonic"]["headcount_6m_ago"]
+    assert six_m["n"] == 0
+    assert six_m["skipped_declined"] == 1
