@@ -62,7 +62,8 @@ from headcount.parsers.anchors import (
     extract_linkedin_exact_count,
     extract_linkedin_jsonld_employees,
     linkedin_bucket_label,
-    looks_gated_linkedin,
+    looks_gated_linkedin_content,
+    looks_gated_linkedin_status,
 )
 from headcount.resolution.normalize import normalize_linkedin_slug
 from headcount.utils.logging import get_logger
@@ -231,37 +232,66 @@ class LinkedInPublicObserver(AnchorSourceAdapter):
         if primary is None:
             return []
         primary_body = primary.text or ""
+        primary_final_url = primary.url or primary_url
 
         # Precedence (lever L2): prefer JSON-LD over the visible-text
-        # badge. The JSON-LD block is written by LinkedIn's SEO pipeline
-        # and survives auth-wall A/B tests, where the visible "Company
-        # size" copy does not. We only fall back to the badge regex when
-        # no schema-encoded numberOfEmployees exists, and we only hit
-        # /about when the primary page yielded nothing parseable at all.
+        # badge. LinkedIn's logged-out company page interleaves the
+        # auth-wall sales copy ("sign in to see") with a perfectly
+        # parseable application/ld+json block carrying numberOfEmployees,
+        # so we *must* attempt structured extraction before letting
+        # content-level gate markers veto the response. /about is only
+        # consulted when both extractors come back empty.
         jsonld = extract_linkedin_jsonld_employees(primary_body)
         badge: ParsedBadge | None = None
         signal_source_url = primary_url
         if jsonld is None:
             badge = extract_linkedin_badge(primary_body)
-            if badge is None:
-                about_url = COMPANY_ABOUT_URL.format(slug=slug)
-                try:
-                    about = await self._fetch(context, about_url, purpose="about")
-                except AdapterGatedError:
-                    # A gate on /about after a clean primary is also a
-                    # signal we're being fingerprinted; count it toward
-                    # the breaker before re-raising.
+        if jsonld is None and badge is None:
+            # Primary yielded nothing structured. Now (and only now) is
+            # it safe to honour the content-level gate marker on the
+            # primary body, because if we'd parsed something we would
+            # have already returned.
+            primary_gate = looks_gated_linkedin_content(primary_body, primary_final_url)
+            if primary_gate is not None:
+                linkedin_gate_total.labels(reason=primary_gate).inc()
+                _log.warning(
+                    "linkedin_gated",
+                    purpose="company",
+                    url=primary_url,
+                    reason=primary_gate,
+                    deferred=True,
+                )
+                self._note_primary_gate()
+                raise AdapterGatedError(f"{primary_gate} on {primary_url}")
+
+            about_url = COMPANY_ABOUT_URL.format(slug=slug)
+            try:
+                about = await self._fetch(context, about_url, purpose="about")
+            except AdapterGatedError:
+                self._note_primary_gate()
+                raise
+            if about is None:
+                return []
+            about_body = about.text or ""
+            about_final_url = about.url or about_url
+            jsonld = extract_linkedin_jsonld_employees(about_body)
+            if jsonld is None:
+                badge = extract_linkedin_badge(about_body)
+            if jsonld is None and badge is None:
+                about_gate = looks_gated_linkedin_content(about_body, about_final_url)
+                if about_gate is not None:
+                    linkedin_gate_total.labels(reason=about_gate).inc()
+                    _log.warning(
+                        "linkedin_gated",
+                        purpose="about",
+                        url=about_url,
+                        reason=about_gate,
+                        deferred=True,
+                    )
                     self._note_primary_gate()
-                    raise
-                if about is None:
-                    return []
-                about_body = about.text or ""
-                jsonld = extract_linkedin_jsonld_employees(about_body)
-                if jsonld is None:
-                    badge = extract_linkedin_badge(about_body)
-                    if badge is None:
-                        return []
-                signal_source_url = about_url
+                    raise AdapterGatedError(f"{about_gate} on {about_url}")
+                return []
+            signal_source_url = about_url
 
         if jsonld is not None:
             signals.append(
@@ -320,12 +350,21 @@ class LinkedInPublicObserver(AnchorSourceAdapter):
         purpose: str,
         soft_gate: bool = False,
     ) -> Any:
-        """Fetch ``url`` and enforce gate detection.
+        """Fetch ``url`` and enforce *status-level* gate detection.
 
-        ``soft_gate=True`` means a gate hit is logged + metered but
-        returns ``None`` instead of raising - used for the /people/
-        probe so a wall there does not discard the main badge signal.
+        Only HTTP-status gates (999 / 429 / 403 / 401 / 407) raise
+        eagerly here, because those are unambiguous server refusals
+        and the body is whatever error template they wanted to ship.
+        Content-level markers ("sign in to see", login redirects) are
+        intentionally NOT raised in this layer: callers parse the body
+        for JSON-LD or badge data first, since LinkedIn routinely
+        embeds usable structured data alongside the auth-wall copy.
+
+        ``soft_gate=True`` still suppresses the eager raise for status
+        gates, used by the ``/people/`` probe so a wall there does not
+        discard the main signal.
         """
+
         # Lever L3: jitter + budget. We only sleep and count calls that
         # will actually hit the network; HttpClient.get returns a
         # CachedResponse with from_cache=True when served locally. The
@@ -348,22 +387,20 @@ class LinkedInPublicObserver(AnchorSourceAdapter):
         if is_network:
             self._requests_made += 1
 
-        body = response.text or ""
-        final_url = response.url or url
-        gate_reason = looks_gated_linkedin(response.status_code, body, final_url)
-        if gate_reason is not None:
-            linkedin_gate_total.labels(reason=gate_reason).inc()
+        status_gate = looks_gated_linkedin_status(response.status_code)
+        if status_gate is not None:
+            linkedin_gate_total.labels(reason=status_gate).inc()
             _log.warning(
                 "linkedin_gated",
                 purpose=purpose,
                 url=url,
-                reason=gate_reason,
+                reason=status_gate,
                 status=response.status_code,
                 soft=soft_gate,
             )
             if soft_gate:
                 return None
-            raise AdapterGatedError(f"{gate_reason} on {url}")
+            raise AdapterGatedError(f"{status_gate} on {url}")
 
         if response.status_code == 404:
             return None
@@ -371,6 +408,27 @@ class LinkedInPublicObserver(AnchorSourceAdapter):
             if soft_gate:
                 return None
             raise AdapterFetchError(f"linkedin_public HTTP {response.status_code} for {url}")
+
+        # Soft callers (e.g. the /people probe) opt into immediate
+        # content-gate handling because the regex they run will not
+        # find anything in an auth-walled body anyway. Hard callers
+        # (the /company and /about flows) defer this check so the
+        # JSON-LD parser gets a turn before we throw the body away.
+        if soft_gate:
+            content_gate = looks_gated_linkedin_content(
+                response.text or "", response.url or url
+            )
+            if content_gate is not None:
+                linkedin_gate_total.labels(reason=content_gate).inc()
+                _log.warning(
+                    "linkedin_gated",
+                    purpose=purpose,
+                    url=url,
+                    reason=content_gate,
+                    status=response.status_code,
+                    soft=True,
+                )
+                return None
         return response
 
     def _badge_signal(

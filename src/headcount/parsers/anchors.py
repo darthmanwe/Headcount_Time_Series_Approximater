@@ -97,8 +97,14 @@ class ParsedBadge:
     phrase: str
 
 
-def looks_gated_linkedin(status_code: int, text: str, final_url: str) -> str | None:
-    """Return a structured gate reason for a LinkedIn response, else None."""
+def looks_gated_linkedin_status(status_code: int) -> str | None:
+    """Return a status-only gate reason, else None.
+
+    Status-level gates (999, 429, 403, 401/407) are unambiguous: the
+    server is refusing to serve the resource and the body is whatever
+    error template they wanted to hand us. We always honour these.
+    """
+
     if status_code == 999:
         # LinkedIn's non-standard "soft bot wall" status. RFC-wise
         # undefined; in practice signals "you have been flagged, stop
@@ -110,6 +116,20 @@ def looks_gated_linkedin(status_code: int, text: str, final_url: str) -> str | N
         return "forbidden"
     if status_code in (401, 407):
         return "auth_required"
+    return None
+
+
+def looks_gated_linkedin_content(text: str, final_url: str) -> str | None:
+    """Return a content-level gate reason, else None.
+
+    Content-level gates (login redirects, "sign in to see" markers,
+    captcha banners) are *advisory*: LinkedIn's logged-out company page
+    routinely interleaves the auth-wall sales copy with a perfectly
+    parseable JSON-LD ``numberOfEmployees`` block. Callers should only
+    consult this signal *after* attempting structured extraction, so
+    they don't throw away usable data.
+    """
+
     parsed = urlparse(final_url)
     if any(parsed.path.startswith(p) for p in _LOGIN_PATH_PREFIXES):
         return "login_redirect"
@@ -118,6 +138,20 @@ def looks_gated_linkedin(status_code: int, text: str, final_url: str) -> str | N
         if marker in lowered:
             return f"marker:{marker.replace(' ', '_')}"
     return None
+
+
+def looks_gated_linkedin(status_code: int, text: str, final_url: str) -> str | None:
+    """Backwards-compatible eager gate detector.
+
+    Combines status- and content-level checks. Kept so existing callers
+    that genuinely want eager rejection (e.g. the ``/people/`` soft-gate
+    probe, where there is no JSON-LD to recover) keep working.
+    """
+
+    status_reason = looks_gated_linkedin_status(status_code)
+    if status_reason is not None:
+        return status_reason
+    return looks_gated_linkedin_content(text, final_url)
 
 
 def extract_linkedin_badge(text: str) -> ParsedBadge | None:

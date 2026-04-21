@@ -299,6 +299,73 @@ async def test_linkedin_uses_jsonld_range_when_visible_badge_absent(
 
 
 @pytest.mark.asyncio
+async def test_linkedin_jsonld_survives_authwall_marker_in_body(
+    fetch_context,
+) -> None:
+    """Regression: real LinkedIn bodies interleave a "sign in to see"
+    auth-wall block with a fully populated JSON-LD organisation node.
+
+    The observer must parse the JSON-LD before honouring the content
+    gate marker; otherwise the cohort run silently throws away every
+    company that tripped the wall (which, in practice, is all of them).
+    """
+
+    primary_calls = 0
+    about_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal primary_calls, about_calls
+        if request.url.path == "/company/acme-inc/":
+            primary_calls += 1
+            return httpx.Response(
+                200, text=_li_text("company_acme_jsonld_walled.html")
+            )
+        if request.url.path == "/company/acme-inc/about/":
+            about_calls += 1
+            return httpx.Response(404)
+        return httpx.Response(404)
+
+    client, context = fetch_context(handler)
+    async with client:
+        signals = await LinkedInPublicObserver().fetch_current_anchor(
+            _target(), context=context
+        )
+
+    assert len(signals) == 1
+    sig = signals[0]
+    assert sig.headcount_value_kind is HeadcountValueKind.exact
+    assert sig.headcount_value_point == 1250
+    assert sig.normalized_payload["kind"] == "jsonld_exact"
+    # /about must NOT be probed when the primary body already produced
+    # a parseable signal, even though it also contains gate markers.
+    assert primary_calls == 1
+    assert about_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_linkedin_authwall_without_jsonld_still_raises_gate(
+    fetch_context,
+) -> None:
+    """Counter-test to the regression above: when the body has a gate
+    marker AND no JSON-LD AND no badge AND /about is also walled, we
+    must still raise so the breaker has a chance to trip."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/company/acme-inc/":
+            return httpx.Response(200, text=_li_text("authwall.html"))
+        if request.url.path == "/company/acme-inc/about/":
+            return httpx.Response(200, text=_li_text("authwall.html"))
+        return httpx.Response(404)
+
+    client, context = fetch_context(handler)
+    obs = LinkedInPublicObserver()
+    async with client:
+        with pytest.raises(AdapterGatedError):
+            await obs.fetch_current_anchor(_target(), context=context)
+    assert obs.consecutive_gates >= 1
+
+
+@pytest.mark.asyncio
 async def test_linkedin_jitter_sleeps_between_network_calls(
     fetch_context, monkeypatch
 ) -> None:
