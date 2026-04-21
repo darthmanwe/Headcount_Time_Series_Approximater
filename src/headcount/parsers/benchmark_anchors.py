@@ -211,16 +211,27 @@ def promote_benchmark_anchors(
     *,
     company_ids: Sequence[str] | None = None,
     observed_at: datetime | None = None,
+    skip_providers: Iterable[BenchmarkProvider] | None = None,
 ) -> PromotionResult:
     """Promote every eligible ``BenchmarkObservation`` into an anchor row.
 
     ``company_ids`` restricts the scan to a subset when supplied; otherwise
     every benchmark observation with a populated ``company_id`` is
     considered. The caller owns the unit of work (no commit here).
+
+    ``skip_providers`` lets the caller suppress promotion for specific
+    benchmark providers. In the Harmonic-primary evaluation setup we pass
+    ``{harmonic, zeeshan, linkedin}`` here so benchmark-workbook rows
+    remain evaluation-only and never leak into the anchor table used by
+    the estimator. Defaults to promoting every provider (original v1
+    behaviour, preserved for tests and any future licensed provider).
     """
 
     result = PromotionResult()
     observed_at = observed_at or datetime.now(tz=UTC)
+    skip_set: frozenset[BenchmarkProvider] = (
+        frozenset(skip_providers) if skip_providers else frozenset()
+    )
 
     stmt = select(BenchmarkObservation).where(BenchmarkObservation.metric.in_(_PROMOTABLE_METRICS))
     if company_ids is not None:
@@ -233,6 +244,10 @@ def promote_benchmark_anchors(
     for obs in rows:
         result.scanned += 1
 
+        if obs.provider in skip_set:
+            # Evaluation-only providers: benchmark rows stay in the
+            # benchmark table for scoring but never become anchors.
+            continue
         if obs.company_id is None:
             result.skipped_no_company += 1
             continue

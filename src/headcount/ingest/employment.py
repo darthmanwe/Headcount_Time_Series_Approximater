@@ -396,6 +396,7 @@ def collect_employment(
     sources: Iterable[str] = (),
     note: str | None = None,
     ocr_observer: object | None = None,
+    benchmark_skip_providers: Iterable[object] | None = None,
 ) -> EmploymentCollectResult:
     """Run the employment-collection stage over a batch of companies.
 
@@ -431,6 +432,7 @@ def collect_employment(
         result.benchmark = promote_benchmark_anchors(
             session,
             company_ids=[c.id for c in companies] if companies else None,
+            skip_providers=benchmark_skip_providers,  # type: ignore[arg-type]
         )
     except Exception as exc:  # pragma: no cover - best-effort safety net
         _log.exception("benchmark_promotion_failed", error=str(exc))

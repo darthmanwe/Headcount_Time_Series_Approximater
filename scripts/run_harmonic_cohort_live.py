@@ -891,12 +891,23 @@ def _main(argv: list[str]) -> int:
         if ocr_observer is not None:
             emp_sources.append("linkedin_ocr")
         try:
+            # Per Phase 11 scope: Harmonic / Zeeshan / LinkedIn benchmark
+            # workbook rows are evaluation-only. They must never be
+            # promoted into anchor observations, or the scoreboard will
+            # read back the very numbers we are supposed to be
+            # approximating (see BUG-leak in HARMONIC_COHORT_LIVE_RUN).
+            from headcount.db.enums import BenchmarkProvider as _BP
             emp_result = _collect_emp(
                 session,
                 company_ids=company_ids,
                 sources=emp_sources,
                 note=f"harmonic_cohort_live mode={args.mode} (blind)",
                 ocr_observer=ocr_observer,
+                benchmark_skip_providers={
+                    _BP.harmonic,
+                    _BP.zeeshan,
+                    _BP.linkedin,
+                },
             )
             summary["stages"]["collect_employment"] = {
                 **emp_result.summary(),

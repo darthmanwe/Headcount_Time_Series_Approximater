@@ -250,6 +250,58 @@ def test_respects_company_id_filter(session: Session) -> None:
     assert anchors[0].company_id == a.id
 
 
+def test_skip_providers_filters_eval_only_sources(session: Session) -> None:
+    """Harmonic / Zeeshan rows must not become anchors in the Phase-11
+    Harmonic-primary evaluation setup: they are the yardstick, not the
+    input. Promoting them would let the estimator read back the very
+    benchmark values the scoreboard is supposed to score against.
+    """
+
+    company = _make_company(session)
+    _bench(
+        session,
+        company_id=company.id,
+        provider=BenchmarkProvider.harmonic,
+        metric=BenchmarkMetric.headcount_current,
+        as_of=date(2026, 4, 1),
+        value_point=500.0,
+        row_index=1,
+    )
+    _bench(
+        session,
+        company_id=company.id,
+        provider=BenchmarkProvider.zeeshan,
+        metric=BenchmarkMetric.headcount_6m_ago,
+        as_of=date(2025, 10, 1),
+        value_point=480.0,
+        row_index=2,
+    )
+    _bench(
+        session,
+        company_id=company.id,
+        provider=BenchmarkProvider.linkedin,
+        metric=BenchmarkMetric.headcount_1y_ago,
+        as_of=date(2025, 4, 1),
+        value_point=420.0,
+        row_index=3,
+    )
+
+    result = promote_benchmark_anchors(
+        session,
+        skip_providers={
+            BenchmarkProvider.harmonic,
+            BenchmarkProvider.zeeshan,
+            BenchmarkProvider.linkedin,
+        },
+    )
+    session.flush()
+
+    assert result.scanned == 3
+    assert result.inserted_anchor_rows == 0
+    anchors = list(session.execute(select(CompanyAnchorObservation)).scalars())
+    assert anchors == []
+
+
 def test_uses_value_kind_from_observation_when_provided(session: Session) -> None:
     company = _make_company(session)
     _bench(
