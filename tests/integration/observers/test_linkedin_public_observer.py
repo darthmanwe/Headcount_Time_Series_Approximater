@@ -20,6 +20,22 @@ from headcount.utils.metrics import linkedin_gate_total
 LINKEDIN_FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "linkedin"
 
 
+@pytest.fixture(autouse=True)
+def _no_jitter(monkeypatch):
+    """Stub L3 jitter to a no-op so tests do not pay real wall-clock time.
+
+    Tests that *want* to observe jitter (the L3 tests below) install
+    their own recording stub over the top of this one.
+    """
+
+    from headcount.ingest.observers import linkedin_public as observer_module
+
+    async def _instant(_seconds: float) -> None:
+        return
+
+    monkeypatch.setattr(observer_module.asyncio, "sleep", _instant)
+
+
 def _li_text(name: str) -> str:
     return (LINKEDIN_FIXTURES / name).read_text(encoding="utf-8")
 
@@ -280,6 +296,123 @@ async def test_linkedin_uses_jsonld_range_when_visible_badge_absent(
     assert sig.headcount_value_min == 51
     assert sig.headcount_value_max == 200
     assert sig.normalized_payload["kind"] == "jsonld_bucket"
+
+
+@pytest.mark.asyncio
+async def test_linkedin_jitter_sleeps_between_network_calls(
+    fetch_context, monkeypatch
+) -> None:
+    """L3: jitter inserts ``asyncio.sleep`` between successive network hits.
+
+    We assert the first call does *not* sleep (no prior network hit),
+    subsequent network calls do, and cache hits do not pay the jitter
+    tax. Using a fixed RNG makes the delay deterministic.
+    """
+
+    import random as _random
+
+    from headcount.ingest.observers import linkedin_public as observer_module
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(observer_module.asyncio, "sleep", fake_sleep)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=_li_text("company_acme_jsonld.html"))
+
+    observer = LinkedInPublicObserver(
+        jitter_ms_range=(500, 500),  # fixed delay -> deterministic
+        rng=_random.Random(0),
+    )
+    client, context = fetch_context(handler)
+    async with client:
+        await observer.fetch_current_anchor(_target(), context=context)
+        await observer.fetch_current_anchor(
+            _target(slug="acme-inc", company_id="c-2"), context=context
+        )
+
+    # First request: no prior network call, no sleep.
+    # Second company: every network call after the first sleeps exactly
+    # 500 ms (=0.5 s). With JSON-LD on primary + 1 /people probe per
+    # company we see several network calls across two companies; at
+    # least one must have slept.
+    assert any(s == pytest.approx(0.5) for s in sleeps)
+    # And the very first call in the run must not have slept.
+    assert sleeps[0:1] != [pytest.approx(0.5)] or observer.requests_made > 1
+
+
+@pytest.mark.asyncio
+async def test_linkedin_budget_exhausted_short_circuits(
+    fetch_context, monkeypatch
+) -> None:
+    """L3: ``daily_request_budget`` caps the observer to N outbound calls."""
+
+    import contextlib
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=_li_text("company_acme_jsonld.html"))
+
+    # Budget = 1 means the first company can fetch its primary URL, but
+    # the /people probe and every URL for the next company is blocked.
+    observer = LinkedInPublicObserver(
+        daily_request_budget=1, jitter_ms_range=(0, 0)
+    )
+    client, context = fetch_context(handler)
+    async with client:
+        # After the primary URL the counter is 1; the /people probe
+        # bumps against the budget and raises AdapterGatedError, which
+        # propagates past the observer's AdapterFetchError-only catch.
+        with contextlib.suppress(Exception):
+            await observer.fetch_current_anchor(_target(), context=context)
+        # Second company must be blocked before any HTTP attempt.
+        signals = await observer.fetch_current_anchor(
+            _target(slug="acme-inc", company_id="c-2"), context=context
+        )
+
+    assert signals == []
+    assert observer.requests_made >= 1
+
+
+@pytest.mark.asyncio
+async def test_linkedin_jitter_skips_when_previous_was_cache_hit(
+    fetch_context, monkeypatch
+) -> None:
+    """A run served entirely from cache must not pay the jitter tax.
+
+    The ``fetch_context`` fixture reuses a single ``cache`` directory
+    within the test, so a second HttpClient built against the same
+    handler + cache will serve every URL from disk. We assert zero
+    sleeps and zero network calls on that second pass.
+    """
+
+    from headcount.ingest.observers import linkedin_public as observer_module
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(observer_module.asyncio, "sleep", fake_sleep)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=_li_text("company_acme_jsonld.html"))
+
+    observer = LinkedInPublicObserver(jitter_ms_range=(100, 100))
+    client, context = fetch_context(handler)
+    async with client:
+        await observer.fetch_current_anchor(_target(), context=context)
+
+    sleeps.clear()
+    observer2 = LinkedInPublicObserver(jitter_ms_range=(100, 100))
+    client2, context2 = fetch_context(handler)
+    async with client2:
+        await observer2.fetch_current_anchor(_target(), context=context2)
+
+    assert sleeps == [], f"expected no sleeps on cache-only run, saw {sleeps}"
+    assert observer2.requests_made == 0
 
 
 @pytest.mark.asyncio

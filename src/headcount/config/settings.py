@@ -63,6 +63,12 @@ class Settings(BaseSettings):
     linkedin_public_circuit_breaker_n: int = Field(
         default=5, alias="LINKEDIN_PUBLIC_CIRCUIT_BREAKER_N", ge=1
     )
+    linkedin_public_request_jitter_ms_min: int = Field(
+        default=250, alias="LINKEDIN_PUBLIC_REQUEST_JITTER_MS_MIN", ge=0
+    )
+    linkedin_public_request_jitter_ms_max: int = Field(
+        default=1750, alias="LINKEDIN_PUBLIC_REQUEST_JITTER_MS_MAX", ge=0
+    )
     linkedin_public_company_ttl_days: int = Field(
         default=30, alias="LINKEDIN_PUBLIC_COMPANY_TTL_DAYS", ge=0
     )

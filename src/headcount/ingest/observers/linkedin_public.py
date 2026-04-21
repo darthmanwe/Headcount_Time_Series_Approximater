@@ -33,6 +33,8 @@ Hard constraints (enforced in code, not conventions)
 
 from __future__ import annotations
 
+import asyncio
+import random
 from datetime import date
 from typing import Any
 
@@ -98,14 +100,39 @@ class LinkedInPublicObserver(AnchorSourceAdapter):
         *,
         anchor_month: date | None = None,
         circuit_threshold: int | None = None,
+        daily_request_budget: int | None = None,
+        jitter_ms_range: tuple[int, int] | None = None,
+        rng: random.Random | None = None,
     ) -> None:
         super().__init__()
+        settings = get_settings()
         self._anchor_month = anchor_month
+
         if circuit_threshold is None:
-            circuit_threshold = get_settings().linkedin_public_circuit_breaker_n
+            circuit_threshold = settings.linkedin_public_circuit_breaker_n
         self._circuit_threshold = max(1, int(circuit_threshold))
+
+        if daily_request_budget is None:
+            daily_request_budget = settings.linkedin_public_max_requests_per_run
+        # Budget 0 means "disabled" for tests and for the cases where
+        # the caller enforces its own cap upstream.
+        self._daily_request_budget = max(0, int(daily_request_budget))
+
+        if jitter_ms_range is None:
+            jitter_ms_range = (
+                settings.linkedin_public_request_jitter_ms_min,
+                settings.linkedin_public_request_jitter_ms_max,
+            )
+        lo, hi = jitter_ms_range
+        if hi < lo:
+            lo, hi = hi, lo
+        self._jitter_ms = (max(0, int(lo)), max(0, int(hi)))
+
+        self._rng = rng if rng is not None else random.Random()
         self._consecutive_gates = 0
         self._circuit_open = False
+        self._requests_made = 0
+        self._last_was_network = False
 
     @property
     def consecutive_gates(self) -> int:
@@ -118,6 +145,33 @@ class LinkedInPublicObserver(AnchorSourceAdapter):
         """True once the streak hit the configured threshold for this run."""
 
         return self._circuit_open
+
+    @property
+    def requests_made(self) -> int:
+        """Count of outbound HTTP requests this observer has issued."""
+
+        return self._requests_made
+
+    def _budget_exhausted(self) -> bool:
+        if self._daily_request_budget <= 0:
+            return False
+        return self._requests_made >= self._daily_request_budget
+
+    async def _apply_jitter(self) -> None:
+        """Sleep a human-scale random amount before the next HTTP call.
+
+        Lever L3: predictable ~1 request/second cadence is itself a
+        bot tell. We insert uniform jitter between ``_jitter_ms`` bounds
+        so adjacent requests look like a person tabbing around rather
+        than a for-loop.
+        """
+
+        lo, hi = self._jitter_ms
+        if hi <= 0:
+            return
+        delay_ms = self._rng.randint(lo, hi) if hi > lo else lo
+        if delay_ms > 0:
+            await asyncio.sleep(delay_ms / 1000.0)
 
     async def fetch_current_anchor(
         self,
@@ -147,6 +201,21 @@ class LinkedInPublicObserver(AnchorSourceAdapter):
                 "linkedin_public_circuit_open_skip",
                 company_id=target.company_id,
                 slug=slug,
+            )
+            return []
+
+        if self._budget_exhausted():
+            # Lever L3: daily request cap. Stop silently so the batch
+            # completes cleanly on other sources; the breaker does not
+            # need to flip because this is a self-imposed limit, not a
+            # server-side signal.
+            linkedin_gate_total.labels(reason="budget_exhausted").inc()
+            _log.warning(
+                "linkedin_public_budget_exhausted",
+                company_id=target.company_id,
+                slug=slug,
+                budget=self._daily_request_budget,
+                requests_made=self._requests_made,
             )
             return []
 
@@ -257,12 +326,27 @@ class LinkedInPublicObserver(AnchorSourceAdapter):
         returns ``None`` instead of raising - used for the /people/
         probe so a wall there does not discard the main badge signal.
         """
+        # Lever L3: jitter + budget. We only sleep and count calls that
+        # will actually hit the network; HttpClient.get returns a
+        # CachedResponse with from_cache=True when served locally. The
+        # jitter only fires once we know the *previous* request went to
+        # the network, so a run made entirely of cache hits stays fast.
+        if self._budget_exhausted():
+            linkedin_gate_total.labels(reason="budget_exhausted").inc()
+            raise AdapterGatedError(f"budget_exhausted on {url}")
+        if self._last_was_network:
+            await self._apply_jitter()
         try:
             response = await context.http.get(self.source_name, url)
         except Exception as exc:  # pragma: no cover - network guard
             raise AdapterFetchError(
                 f"linkedin_public {purpose} fetch failed for {url}: {exc!r}"
             ) from exc
+
+        is_network = not getattr(response, "from_cache", False)
+        self._last_was_network = is_network
+        if is_network:
+            self._requests_made += 1
 
         body = response.text or ""
         final_url = response.url or url
