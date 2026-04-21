@@ -5,8 +5,59 @@
 > (SEC, Wikidata, company-web, LinkedIn public, LinkedIn OCR, manual anchors).
 > This is the honest production snapshot.
 >
-> Run dir: `data/runs/harmonic_live/20260420T231635Z/`
+> Baseline run dir: `data/runs/harmonic_live/20260420T231635Z/`
+> Post-L1..L4+bugfix run dir: `data/runs/harmonic_live/20260421T003808Z/`
 > Mode: `live-full` | Cohort: 21 of 24 Harmonic-sampled companies
+
+## Change log (this document)
+
+| Revision | Change | Delta |
+| --- | --- | --- |
+| Baseline (20260420T231635Z) | Initial blind run, 10 bugs logged | Harmonic MAPE `n=0` (no evaluable rows) |
+| After BUG-A (slug resolver) | LinkedIn attempts visible, still all gated | unchanged |
+| After BUG-B (estimator 0.0 fallback) + L1+L2+L4+L3 | 999 rate dropped to ~30%, bodies arrive as 200s | signals_written 1 → 1 (gate check still blocked JSON-LD) |
+| After **L2 gate-order fix** | JSON-LD parsed on 4/6 resolved slugs | signals_written **1 → 5**, companies_with_signals **1 → 5** |
+| After **BUG-G (eval)** | `degraded_current_only` counts as real for current | Harmonic `n=0 → 6`, **MAPE 27.57%**, 3 companies within 3% |
+
+See [LINKEDIN_BOT_WALL_STRATEGY.md](LINKEDIN_BOT_WALL_STRATEGY.md) for L1..L7 lever catalogue.
+
+## Post-fix headline (latest run)
+
+| Provider | n | MAPE | MAE | Median abs err |
+| --- | ---: | ---: | ---: | ---: |
+| Harmonic (primary) | 6 | **27.57%** | 95.67 | 71.0 |
+| Zeeshan (supporting) | 6 | 14.41% | 18.08 | 0.0 |
+| LinkedIn benchmark (supporting) | 6 | 49.00% | 61.50 | 0.0 |
+
+- `companies_declined_to_estimate`: **15** (down from 21; 15 still
+  have no LinkedIn slug and nothing else parseable).
+- `signals_written`: 5 total — 4 from `linkedin_public` JSON-LD, 1
+  from `company_web`.
+- Confidence bands: 456 months `low`, 1,140 months `manual_review_required`.
+
+### Per-company (Harmonic vs our current estimate)
+
+| Company | Harmonic | Our estimate | Confidence | Err % |
+| --- | ---: | ---: | ---: | ---: |
+| AllTrails | 376 | 376 | 0.665 | **0.0** |
+| AlphaSense | 2,969 | 3,044 | 0.665 | **+2.5** |
+| AppZen | 376 | 386 | 0.665 | **+2.7** |
+| Alpaca | 390 | 275 | 0.620 | -29.5 |
+| 15Five | 602 | 295 | 0.665 | -51.0 |
+| Arable | 84 | 17 | 0.665 | -79.8 |
+
+Three companies within 3% of Harmonic suggests LinkedIn JSON-LD is an
+accurate source when LinkedIn serves it. The three misses all point
+the same direction (underestimate), suggesting:
+- **Arable**: LinkedIn slug `arable` resolves to "Arable Consulting"
+  (a different company) — a disambiguation bug, not a scrape problem.
+- **15Five, Alpaca**: LinkedIn's public JSON-LD reports a smaller
+  count than Harmonic's truth. This is either stale data on LinkedIn
+  or Harmonic counting contractors.
+
+---
+
+## Historical baseline snapshot (kept for reference)
 
 ## Methodology
 
