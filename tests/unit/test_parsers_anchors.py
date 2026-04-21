@@ -21,6 +21,7 @@ from headcount.parsers.anchors import (
     clean_html_to_text,
     extract_linkedin_jsonld_employees,
     linkedin_bucket_label,
+    parse_company_web_jsonld,
     parse_company_web_text,
     parse_sec_company_facts,
     parse_wikidata_row,
@@ -31,7 +32,7 @@ def test_parser_versions_exposed() -> None:
     # Observers pin their parser_version to these constants; making a
     # regression noisy is the point of this test.
     assert LINKEDIN_PUBLIC_PARSER_VERSION == "linkedin_public_v2"
-    assert COMPANY_WEB_PARSER_VERSION == "company_web_v1"
+    assert COMPANY_WEB_PARSER_VERSION == "company_web_v2"
     assert SEC_PARSER_VERSION == "sec_v1"
     assert WIKIDATA_PARSER_VERSION == "wikidata_v1"
 
@@ -238,6 +239,96 @@ def test_company_web_dedups_qualified_tail() -> None:
 
 def test_company_web_empty() -> None:
     assert parse_company_web_text("Nothing to see here.") == []
+
+
+# ---------------------------------------------------------------------------
+# company-web v2: wider stems + new phrasings + JSON-LD
+# ---------------------------------------------------------------------------
+
+
+def test_company_web_matches_fte_stem() -> None:
+    matches = parse_company_web_text("Global workforce of 1,450 FTEs as of Q3.")
+    assert any(m.value_point == 1450 for m in matches)
+
+
+def test_company_web_matches_colleagues_stem() -> None:
+    matches = parse_company_web_text("Our 12,000 colleagues deliver for clients.")
+    assert any(m.value_point == 12000 for m in matches)
+
+
+def test_company_web_matches_associates_stem() -> None:
+    matches = parse_company_web_text("We employ 230 associates in 4 offices.")
+    assert any(m.value_point == 230 for m in matches)
+
+
+def test_company_web_matches_n_person_phrasing() -> None:
+    matches = parse_company_web_text("We are a 50-person engineering organization.")
+    phrases = [m.phrase.lower() for m in matches]
+    assert any("50-person" in p for p in phrases)
+    hit = next(m for m in matches if "50-person" in m.phrase.lower())
+    assert hit.qualifier == "n-person"
+    assert hit.value_point == 50
+
+
+def test_company_web_matches_crew_of_and_squad_of() -> None:
+    assert any(
+        m.value_point == 24 for m in parse_company_web_text("Led by a crew of 24.")
+    )
+    assert any(
+        m.value_point == 33 for m in parse_company_web_text("A squad of 33 engineers.")
+    )
+
+
+def test_company_web_matches_strong_idiom_with_plus() -> None:
+    matches = parse_company_web_text("Now 500+ strong across 5 countries.")
+    m = next(m for m in matches if m.qualifier == "strong")
+    assert m.value_min == 500
+    # "+ strong" widens the upper bound.
+    assert m.value_max == pytest.approx(500 * 1.25)
+
+
+def test_company_web_matches_headcount_idiom() -> None:
+    matches = parse_company_web_text("Current headcount: 312 (as of 2024).")
+    m = next(m for m in matches if m.qualifier == "headcount")
+    assert m.kind is HeadcountValueKind.exact
+    assert m.value_point == 312
+
+
+def test_company_web_jsonld_returns_match_for_exact_number() -> None:
+    html = (
+        '<script type="application/ld+json">'
+        '{"@context":"https://schema.org","@type":"Organization",'
+        '"name":"Acme","numberOfEmployees":427}'
+        "</script>"
+    )
+    matches = parse_company_web_jsonld(html)
+    assert len(matches) == 1
+    m = matches[0]
+    assert m.qualifier == "jsonld"
+    assert m.kind is HeadcountValueKind.exact
+    assert m.value_point == 427
+
+
+def test_company_web_jsonld_returns_match_for_quantitative_value_range() -> None:
+    html = (
+        '<script type="application/ld+json">'
+        '{"@context":"https://schema.org","@type":"Organization",'
+        '"name":"Acme","numberOfEmployees":'
+        '{"@type":"QuantitativeValue","minValue":51,"maxValue":200}}'
+        "</script>"
+    )
+    matches = parse_company_web_jsonld(html)
+    assert len(matches) == 1
+    m = matches[0]
+    assert m.kind is HeadcountValueKind.bucket
+    assert m.value_min == 51
+    assert m.value_max == 200
+    assert m.value_point == pytest.approx(125.5)
+
+
+def test_company_web_jsonld_empty_when_no_organization() -> None:
+    html = '<script type="application/ld+json">{"@type":"WebSite","name":"X"}</script>'
+    assert parse_company_web_jsonld(html) == []
 
 
 # ---------------------------------------------------------------------------

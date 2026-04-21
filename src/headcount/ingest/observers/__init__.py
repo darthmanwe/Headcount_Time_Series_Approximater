@@ -11,6 +11,7 @@ from headcount.ingest.observers.company_web import CompanyWebObserver
 from headcount.ingest.observers.linkedin_public import LinkedInPublicObserver
 from headcount.ingest.observers.manual import ManualAnchorObserver
 from headcount.ingest.observers.sec import SECObserver
+from headcount.ingest.observers.wayback import WaybackObserver
 from headcount.ingest.observers.wikidata import WikidataObserver
 
 __all__ = [
@@ -18,5 +19,6 @@ __all__ = [
     "LinkedInPublicObserver",
     "ManualAnchorObserver",
     "SECObserver",
+    "WaybackObserver",
     "WikidataObserver",
 ]

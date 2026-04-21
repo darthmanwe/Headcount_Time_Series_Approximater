@@ -59,6 +59,11 @@ from headcount.ingest.rate_limit import (
     CircuitBreaker,
     SourceBudgetStore,
 )
+from headcount.ingest.raw_response_store import (
+    NullRawResponseSink,
+    RawResponseSink,
+    build_sink_from_session,
+)
 from headcount.models.company import Company
 from headcount.models.company_alias import CompanyAlias
 from headcount.models.company_anchor_observation import CompanyAnchorObservation
@@ -130,7 +135,12 @@ def _company_target(session: Session, company: Company) -> CompanyTarget:
     )
 
 
-def _create_run(session: Session, *, method_version: str) -> Run:
+def _create_run(
+    session: Session,
+    *,
+    method_version: str,
+    label: str | None = None,
+) -> Run:
     settings = get_settings()
     now = datetime.now(tz=UTC)
     run = Run(
@@ -142,6 +152,7 @@ def _create_run(session: Session, *, method_version: str) -> Run:
         anchor_policy_version=settings.anchor_policy_version,
         coverage_curve_version=settings.coverage_curve_version,
         config_hash="collect-anchors",
+        label=label,
     )
     session.add(run)
     session.flush()
@@ -268,6 +279,8 @@ async def collect_anchors(
     trip_after: int = 5,
     method_version: str | None = None,
     review_writer: ReviewQueueWriter | None = None,
+    run_label: str | None = None,
+    raw_response_sink: RawResponseSink | None = None,
 ) -> CollectResult:
     """Collect anchor signals from every adapter for every company.
 
@@ -277,7 +290,9 @@ async def collect_anchors(
     """
     settings = get_settings()
     method_version = method_version or settings.method_version
-    run = run or _create_run(session, method_version=method_version)
+    run = run or _create_run(
+        session, method_version=method_version, label=run_label
+    )
     session.flush()
     result = CollectResult(run_id=run.id)
     budget_store = budget_store or SourceBudgetStore(
@@ -293,7 +308,27 @@ async def collect_anchors(
 
     if http_client is None:
         cache = FileCache(settings.cache_dir)
-        http_client = HttpClient(cache=cache, configs={})
+        # Plan C: mirror every live response into raw_response so
+        # parser-version bumps or forensic audits can replay the
+        # original bytes without re-hitting rate-limited upstreams.
+        # Explicit opt-out via ``NullRawResponseSink``. When the
+        # caller supplies their own HttpClient they own the sink
+        # wiring; we don't mutate someone else's client here.
+        sink = raw_response_sink
+        if sink is None:
+            sink = build_sink_from_session(session)
+        http_client = HttpClient(
+            cache=cache, configs={}, raw_response_sink=sink
+        )
+    elif (
+        raw_response_sink is not None
+        and getattr(http_client, "_raw_response_sink", None) is None
+        and not isinstance(raw_response_sink, NullRawResponseSink)
+    ):
+        # Caller supplied a client without a sink but asked us to
+        # archive. Attach the sink in-place so the rest of the call
+        # benefits from write-through.
+        http_client._raw_response_sink = raw_response_sink  # noqa: SLF001
 
     companies = list(
         companies
@@ -480,5 +515,20 @@ def default_http_configs() -> dict[SourceName, HttpClientConfig]:
             # essentially free until the TTL rolls.
             max_concurrency=1,
             cache_ttl_seconds=settings.linkedin_public_company_ttl_days * 86400,
+        ),
+        SourceName.wayback: HttpClientConfig(
+            # Internet Archive is archival-mission-friendly and accepts
+            # a clearly-identified UA without any special handshake.
+            # Keep concurrency modest because a single company produces
+            # up to 2 origins * 3 horizons = 6 availability lookups plus
+            # up to 6 snapshot fetches. Cache TTL is long: a snapshot
+            # dated 2023-06 is immutable, so once we've read it we never
+            # need to read it again until the parser version bumps.
+            user_agent=(
+                "Headcount-Estimator/0.1 (+archive-research; "
+                "contact@example.com)"
+            ),
+            max_concurrency=2,
+            cache_ttl_seconds=30 * 24 * 3600,
         ),
     }

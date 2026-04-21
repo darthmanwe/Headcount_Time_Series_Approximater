@@ -347,6 +347,7 @@ def collect_anchors(
         LinkedInPublicObserver,
         ManualAnchorObserver,
         SECObserver,
+        WaybackObserver,
         WikidataObserver,
     )
     from headcount.models.company import Company
@@ -361,8 +362,13 @@ def collect_anchors(
     )
     # Live-only sources: make this explicit so nobody accidentally fans
     # out logged-out LinkedIn scrapes (or company-web crawls) during a
-    # test/smoke run.
-    _live_only = {SourceName.company_web, SourceName.linkedin_public}
+    # test/smoke run. Wayback is live-only too: it still makes outbound
+    # HTTP, just to archive.org rather than to the target.
+    _live_only = {
+        SourceName.company_web,
+        SourceName.linkedin_public,
+        SourceName.wayback,
+    }
     if not live:
         dropped = [s for s in requested if s in _live_only]
         for s in dropped:
@@ -388,6 +394,8 @@ def collect_anchors(
             adapters.append(CompanyWebObserver())
         elif src is SourceName.linkedin_public:
             adapters.append(LinkedInPublicObserver())
+        elif src is SourceName.wayback:
+            adapters.append(WaybackObserver())
         else:
             log.warning("unknown_source_ignored", source=src.value)
 
@@ -403,10 +411,21 @@ def collect_anchors(
 
             settings = get_settings()
             cache = FileCache(cache_root or settings.cache_dir)
+            # Only attach the raw-response sink for live fetches.
+            # Offline / canned-transport runs would pollute the archive
+            # with test fixtures that have no real upstream provenance.
+            raw_sink = None
+            if live:
+                from headcount.ingest.raw_response_store import (
+                    build_sink_from_session,
+                )
+
+                raw_sink = build_sink_from_session(session)
             http = HttpClient(
                 cache=cache,
                 configs=default_http_configs(),
                 transport=None if live else _offline_transport(),
+                raw_response_sink=raw_sink,
             )
             result = await _collect(
                 session,
@@ -1478,6 +1497,7 @@ def run_pipeline(
         LinkedInPublicObserver,
         ManualAnchorObserver,
         SECObserver,
+        WaybackObserver,
         WikidataObserver,
     )
     from headcount.ingest.seeds import import_candidates, load_benchmarks
@@ -1526,14 +1546,29 @@ def run_pipeline(
     ) -> dict[str, object]:
         settings = get_settings()
         cache = FileCache(settings.cache_dir)
+        raw_sink = None
+        if live:
+            from headcount.ingest.raw_response_store import (
+                build_sink_from_session,
+            )
+
+            raw_sink = build_sink_from_session(session)
         http = HttpClient(
             cache=cache,
             configs=default_http_configs(),
             transport=None if live else _offline_transport(),
+            raw_response_sink=raw_sink,
         )
         adapters: list[object] = [ManualAnchorObserver(), SECObserver(), WikidataObserver()]
         if live:
             adapters.append(CompanyWebObserver())
+            # Wayback is safe to run whenever live HTTP is allowed: it
+            # hits archive.org rather than the target. Gating it behind
+            # ``live`` keeps offline tests deterministic; gating it
+            # before ``full_live`` means we pull historical anchors in
+            # the same configuration that grants us current-month
+            # company_web anchors.
+            adapters.append(WaybackObserver())
         if full_live:
             adapters.append(LinkedInPublicObserver())
         result = await _collect_anchors(

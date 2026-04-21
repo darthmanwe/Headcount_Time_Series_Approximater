@@ -26,6 +26,7 @@ from headcount.models.manual_override import ManualOverride
 from headcount.models.person import Person
 from headcount.models.person_employment_observation import PersonEmploymentObservation
 from headcount.models.person_identity_merge import PersonIdentityMerge
+from headcount.models.raw_response import RawResponse
 from headcount.models.review_queue_item import ReviewQueueItem
 from headcount.models.run import CompanyRunStatus, Run
 from headcount.models.source_budget import SourceBudget
@@ -53,6 +54,7 @@ __all__ = [
     "Person",
     "PersonEmploymentObservation",
     "PersonIdentityMerge",
+    "RawResponse",
     "ReviewQueueItem",
     "Run",
     "SourceBudget",

@@ -34,13 +34,19 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 
 def _bootstrap(run_dir: Path) -> None:
-    db_path = (run_dir / "cohort.sqlite").resolve()
-    cache_dir = (run_dir / "http_cache").resolve()
+    """Canonical DB + cache; run_dir is artifacts only. Env overrides
+    still win so callers can sandbox."""
+
     run_artifact_dir = (run_dir / "run_artifacts").resolve()
-    for p in (cache_dir, run_artifact_dir):
-        p.mkdir(parents=True, exist_ok=True)
-    os.environ["DB_URL"] = f"sqlite:///{db_path.as_posix()}"
-    os.environ["CACHE_DIR"] = str(cache_dir)
+    run_artifact_dir.mkdir(parents=True, exist_ok=True)
+    if not os.environ.get("DB_URL", "").strip():
+        canonical_db = (REPO_ROOT / "data" / "headcount.sqlite").resolve()
+        canonical_db.parent.mkdir(parents=True, exist_ok=True)
+        os.environ["DB_URL"] = f"sqlite:///{canonical_db.as_posix()}"
+    if not os.environ.get("CACHE_DIR", "").strip():
+        canonical_cache = (REPO_ROOT / "data" / "cache").resolve()
+        canonical_cache.mkdir(parents=True, exist_ok=True)
+        os.environ["CACHE_DIR"] = str(canonical_cache)
     os.environ["RUN_ARTIFACT_DIR"] = str(run_artifact_dir)
 
 
@@ -138,7 +144,13 @@ def main() -> int:
         )
 
         cache = FileCache(Path(os.environ["CACHE_DIR"]))
-        http = HttpClient(cache=cache, configs=default_http_configs())
+        from headcount.ingest.raw_response_store import build_sink_from_session
+
+        http = HttpClient(
+            cache=cache,
+            configs=default_http_configs(),
+            raw_response_sink=build_sink_from_session(session),
+        )
         stats = backfill_linkedin_slugs(
             session,
             company_ids=missing_ids,
@@ -187,6 +199,7 @@ def main() -> int:
                 adapters=adapters,
                 companies=newly_slugged,
                 http_client=http,
+                run_label=f"retry_declined_slugs:{run_dir.name}",
             )
 
         result = asyncio.run(_run_anchors())

@@ -31,14 +31,18 @@ import logging
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
 from headcount.db.enums import SourceName
 from headcount.utils.logging import get_logger
 from headcount.utils.metrics import source_fetch_total
+
+if TYPE_CHECKING:
+    from headcount.ingest.raw_response_store import RawResponseSink
 
 _log = get_logger("headcount.ingest.http")
 
@@ -196,6 +200,7 @@ class HttpClient:
         cache: FileCache,
         configs: Mapping[SourceName, HttpClientConfig] | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
+        raw_response_sink: RawResponseSink | None = None,
     ) -> None:
         self._cache = cache
         self._configs = dict(configs or {})
@@ -203,6 +208,13 @@ class HttpClient:
         self._semaphores: dict[SourceName, asyncio.Semaphore] = {}
         self._client: httpx.AsyncClient | None = None
         self._transport = transport
+        # Optional write-through archive. When set, every live (non
+        # cache-hit) response is mirrored into the raw_response table
+        # so a later ``reparse_raw_responses`` run can reprocess the
+        # bytes without re-fetching the upstream URL. Sink errors are
+        # swallowed inside the sink; the fetch path never fails on
+        # archival issues.
+        self._raw_response_sink = raw_response_sink
 
     @property
     def cache(self) -> FileCache:
@@ -342,4 +354,55 @@ class HttpClient:
         cached_response = CachedResponse.from_httpx(response)
         if cache and response.status_code < 400 and config.cache_ttl_seconds > 0:
             self._cache.store(source_name, cache_key, cached_response)
+        # Write-through to the raw-response archive. Only mirrors
+        # successful live responses - redirects and 5xx pages are
+        # already covered by the file cache for intra-run replay but
+        # would bloat the long-lived DB without adding parse value.
+        if (
+            self._raw_response_sink is not None
+            and response.status_code < 400
+            and cached_response.text
+        ):
+            self._archive_response(
+                source_name=source_name,
+                method=method,
+                response=cached_response,
+            )
         return cached_response
+
+    def _archive_response(
+        self,
+        *,
+        source_name: SourceName,
+        method: str,
+        response: CachedResponse,
+    ) -> None:
+        """Best-effort write to the raw-response archive.
+
+        Delegated to the sink which handles its own exceptions. This
+        wrapper keeps the import local so a client built without
+        ORM access (eg unit tests that stub out the DB) stays fast.
+        """
+
+        if self._raw_response_sink is None:
+            return
+        try:
+            from headcount.ingest.raw_response_store import RawResponseWrite
+
+            payload = RawResponseWrite(
+                url=response.url,
+                method=method,
+                status_code=response.status_code,
+                body_text=response.text,
+                headers=response.headers,
+                source_hint=source_name.value,
+                fetched_at=datetime.now(tz=UTC),
+            )
+            self._raw_response_sink.write(payload)
+        except Exception as exc:  # pragma: no cover - defensive
+            _log.debug(
+                "raw_response_archive_skipped",
+                source=source_name.value,
+                url=response.url,
+                error=repr(exc),
+            )

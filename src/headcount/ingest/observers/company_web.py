@@ -42,6 +42,7 @@ from headcount.ingest.base import (
 from headcount.parsers.anchors import (
     COMPANY_WEB_PARSER_VERSION,
     clean_html_to_text,
+    parse_company_web_jsonld,
     parse_company_web_text,
 )
 from headcount.utils.logging import get_logger
@@ -112,10 +113,26 @@ class CompanyWebObserver(AnchorSourceAdapter):
                 continue
             if response.status_code >= 400:
                 continue
-            text = clean_html_to_text(response.text or "")
-            if not text:
-                continue
-            for match in parse_company_web_text(text):
+            html = response.text or ""
+            # v2: try structured JSON-LD ``numberOfEmployees`` first.
+            # Confidence is bumped vs. text patterns because schema.org
+            # is an external contract (hard to ship accidentally) and
+            # SEO crawlers rely on these fields staying accurate.
+            matches = parse_company_web_jsonld(html)
+            jsonld_confidence = 0.70
+            text_matches: list = []
+            if not matches:
+                text = clean_html_to_text(html)
+                if text:
+                    text_matches = parse_company_web_text(text)
+            combined = [(m, True) for m in matches] + [(m, False) for m in text_matches]
+            for match, from_jsonld in combined:
+                if from_jsonld:
+                    confidence = jsonld_confidence
+                elif match.qualifier in (None, "headcount"):
+                    confidence = 0.65
+                else:
+                    confidence = 0.55
                 signals.append(
                     RawAnchorSignal(
                         source_name=self.source_name,
@@ -127,15 +144,19 @@ class CompanyWebObserver(AnchorSourceAdapter):
                         headcount_value_point=match.value_point,
                         headcount_value_max=match.value_max,
                         headcount_value_kind=match.kind,
-                        confidence=0.55 if match.qualifier else 0.65,
+                        confidence=confidence,
                         raw_text=match.phrase,
                         parser_version=self.parser_version,
                         parse_status=ParseStatus.ok,
-                        note=f"path={path} qualifier={match.qualifier or 'exact'}",
+                        note=(
+                            f"path={path} qualifier={match.qualifier or 'exact'}"
+                            + (" jsonld=1" if from_jsonld else "")
+                        ),
                         normalized_payload={
                             "path": path,
                             "qualifier": match.qualifier,
                             "phrase": match.phrase,
+                            "jsonld": bool(from_jsonld),
                         },
                     )
                 )

@@ -45,6 +45,13 @@ class Run(UUIDPk, Timestamped, Base):
         nullable=True,
     )
     note: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    # Human-readable tag so many overlapping runs can share the one
+    # canonical DB without collapsing into an anonymous soup. Examples:
+    # "harmonic_cohort:postleak", "retry:arable",
+    # "wayback_backfill:2026-04-21", "ad_hoc". Not unique (reruns reuse
+    # the label intentionally) and not required (legacy rows keep
+    # NULL).
+    label: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
 
 class CompanyRunStatus(UUIDPk, Timestamped, Base):

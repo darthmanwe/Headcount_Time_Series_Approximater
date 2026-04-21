@@ -59,19 +59,55 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _canonical_db_url() -> str:
+    """Absolute ``sqlite:///`` URL for the long-lived, shared database.
+
+    Every cohort run, retry, and backfill writes into one file so
+    legitimate observations compound across runs. Callers that need
+    true isolation can still override via ``DB_URL`` before launching
+    the script.
+    """
+
+    env_override = os.environ.get("DB_URL", "").strip()
+    if env_override:
+        return env_override
+    canonical = (REPO_ROOT / "data" / "headcount.sqlite").resolve()
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    return f"sqlite:///{canonical.as_posix()}"
+
+
+def _canonical_cache_dir() -> Path:
+    """Shared HTTP cache directory.
+
+    Same reasoning as the DB: a successful fetch against LinkedIn or
+    Wayback in one run should be reusable by the next one, so we point
+    every run at the same cache tree unless ``CACHE_DIR`` is already
+    set.
+    """
+
+    env_override = os.environ.get("CACHE_DIR", "").strip()
+    if env_override:
+        return Path(env_override)
+    return (REPO_ROOT / "data" / "cache").resolve()
+
+
 def _bootstrap_env(run_dir: Path) -> None:
-    db_path = (run_dir / "cohort.sqlite").resolve()
-    cache_dir = (run_dir / "http_cache").resolve()
+    """Wire env vars for the canonical DB + cache, per-run artifact dirs.
+
+    Previously this created per-run DB and cache files under ``run_dir``,
+    which meant every cohort run started from zero - every successful
+    LinkedIn / Wayback / company-web fetch vanished when the run
+    finished. Now DB_URL and CACHE_DIR point at long-lived locations
+    by default; only artifact dirs (logs, scoreboards, DuckDB export)
+    stay per-run so experiments remain inspectable.
+    """
+
     run_artifact_dir = (run_dir / "run_artifacts").resolve()
     duckdb_path = (run_dir / "outputs" / "cohort.duckdb").resolve()
-    for p in (
-        db_path.parent,
-        cache_dir,
-        run_artifact_dir,
-        duckdb_path.parent,
-    ):
+    cache_dir = _canonical_cache_dir()
+    for p in (cache_dir, run_artifact_dir, duckdb_path.parent):
         p.mkdir(parents=True, exist_ok=True)
-    os.environ["DB_URL"] = f"sqlite:///{db_path.as_posix()}"
+    os.environ["DB_URL"] = _canonical_db_url()
     os.environ["CACHE_DIR"] = str(cache_dir)
     os.environ["RUN_ARTIFACT_DIR"] = str(run_artifact_dir)
     os.environ["DUCKDB_PATH"] = str(duckdb_path)
@@ -201,6 +237,7 @@ async def _collect_anchors_scoped(
     *,
     mode: str,
     rate_guard: Any | None = None,
+    run_label: str | None = None,
 ) -> dict[str, object]:
     """Dispatch the full public-source observer stack against a scoped company list.
 
@@ -222,19 +259,35 @@ async def _collect_anchors_scoped(
         LinkedInPublicObserver,
         ManualAnchorObserver,
         SECObserver,
+        WaybackObserver,
         WikidataObserver,
     )
+    from headcount.ingest.raw_response_store import build_sink_from_session
 
     settings = get_settings()
     cache = FileCache(settings.cache_dir)
+    # Plan C: every live response this cohort run sees is mirrored into
+    # ``raw_response`` so a parser-version bump or a reparse-all pass
+    # can reprocess the same bytes without re-hitting LinkedIn /
+    # company websites / Wayback. Sink errors are swallowed inside the
+    # sink itself - archival is best-effort and never fails a fetch.
+    raw_sink = build_sink_from_session(session)
     http = HttpClient(
         cache=cache,
         configs=default_http_configs(),
         transport=None,  # live
+        raw_response_sink=raw_sink,
     )
     adapters: list[object] = [ManualAnchorObserver(), SECObserver(), WikidataObserver()]
     if mode in {"live-safe", "live-full"}:
         adapters.append(CompanyWebObserver())
+        # Wayback is included from live-safe onward because the only
+        # outbound host is archive.org; it never touches LinkedIn or
+        # target-company infra. Running it in both modes gives the
+        # estimator real historical anchors to pair with the current-
+        # month live anchor, which is what unlocks the 6m/1y/2y growth
+        # metrics.
+        adapters.append(WaybackObserver())
     if mode == "live-full":
         adapters.append(LinkedInPublicObserver(rate_guard=rate_guard))
     result = await _collect_anchors(
@@ -242,6 +295,7 @@ async def _collect_anchors_scoped(
         adapters=adapters,  # type: ignore[arg-type]
         companies=companies,
         http_client=http,
+        run_label=run_label,
     )
     return result.summary()
 
@@ -575,6 +629,16 @@ def _main(argv: list[str]) -> int:
             " 999s without the breaker fully tripping."
         ),
     )
+    parser.add_argument(
+        "--run-label",
+        default=None,
+        help=(
+            "Human-readable tag attached to the Run row, e.g."
+            " 'harmonic_cohort:postleak' or 'wayback_backfill'. Defaults"
+            " to 'harmonic_cohort:<run_dir_basename>' so each cohort run"
+            " stays filterable in the shared canonical DB."
+        ),
+    )
     args = parser.parse_args(argv)
 
     run_dir = (
@@ -583,6 +647,8 @@ def _main(argv: list[str]) -> int:
         else REPO_ROOT / "data" / "runs" / "harmonic_live" / _now_stamp()
     )
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    run_label = args.run_label or f"harmonic_cohort:{run_dir.name}"
 
     _bootstrap_env(run_dir)
     _run_alembic_upgrade()
@@ -602,7 +668,12 @@ def _main(argv: list[str]) -> int:
     from headcount.resolution.resolver import _backfill_benchmark_links
 
     ctx = RunContext(run_dir=run_dir, mode=args.mode)
-    summary: dict[str, Any] = {"mode": args.mode, "stages": {}, "run_dir": str(run_dir)}
+    summary: dict[str, Any] = {
+        "mode": args.mode,
+        "run_label": run_label,
+        "stages": {},
+        "run_dir": str(run_dir),
+    }
 
     def _month(raw: str) -> date:
         raw = raw.strip()
@@ -708,10 +779,19 @@ def _main(argv: list[str]) -> int:
         if args.mode in {"live-safe", "live-full"}:
             try:
                 settings = get_settings()
+                # Sink attached here too - slug probes are the single
+                # biggest source of LinkedIn requests per run, and
+                # archiving their HTML lets us re-run slug heuristics
+                # offline if we ever tweak the disambiguator.
+                from headcount.ingest.raw_response_store import (
+                    build_sink_from_session,
+                )
+
                 slug_http = HttpClient(
                     cache=FileCache(settings.cache_dir),
                     configs=default_http_configs(),
                     transport=None,
+                    raw_response_sink=build_sink_from_session(session),
                 )
                 slug_stats = backfill_linkedin_slugs(
                     session,
@@ -748,7 +828,11 @@ def _main(argv: list[str]) -> int:
         try:
             anchor_summary = asyncio.run(
                 _collect_anchors_scoped(
-                    session, companies, mode=args.mode, rate_guard=rate_guard
+                    session,
+                    companies,
+                    mode=args.mode,
+                    rate_guard=rate_guard,
+                    run_label=run_label,
                 )
             )
             summary["stages"]["collect_anchors"] = {
@@ -857,6 +941,7 @@ def _main(argv: list[str]) -> int:
                         retry_companies,
                         mode=args.mode,
                         rate_guard=rate_guard,
+                        run_label=f"{run_label}:retry",
                     )
                 )
                 retry_meta["retry_summary"] = dict(retry_summary)

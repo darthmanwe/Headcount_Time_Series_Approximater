@@ -19,13 +19,20 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 
 def _bootstrap(run_dir: Path) -> None:
-    db_path = (run_dir / "cohort.sqlite").resolve()
-    cache_dir = (run_dir / "http_cache").resolve()
+    """Point the process at the canonical DB; run_dir is only used for
+    output artifacts. Env overrides (DB_URL / CACHE_DIR) still win so
+    sandboxing a specific run is possible."""
+
     run_artifact_dir = (run_dir / "run_artifacts").resolve()
-    for p in (cache_dir, run_artifact_dir):
-        p.mkdir(parents=True, exist_ok=True)
-    os.environ["DB_URL"] = f"sqlite:///{db_path.as_posix()}"
-    os.environ["CACHE_DIR"] = str(cache_dir)
+    run_artifact_dir.mkdir(parents=True, exist_ok=True)
+    if not os.environ.get("DB_URL", "").strip():
+        canonical_db = (REPO_ROOT / "data" / "headcount.sqlite").resolve()
+        canonical_db.parent.mkdir(parents=True, exist_ok=True)
+        os.environ["DB_URL"] = f"sqlite:///{canonical_db.as_posix()}"
+    if not os.environ.get("CACHE_DIR", "").strip():
+        canonical_cache = (REPO_ROOT / "data" / "cache").resolve()
+        canonical_cache.mkdir(parents=True, exist_ok=True)
+        os.environ["CACHE_DIR"] = str(canonical_cache)
     os.environ["RUN_ARTIFACT_DIR"] = str(run_artifact_dir)
 
 

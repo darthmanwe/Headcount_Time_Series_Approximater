@@ -16,6 +16,18 @@ from sqlalchemy.orm import Session, sessionmaker
 from headcount.config import get_settings
 
 
+_SQLITE_BUSY_TIMEOUT_MS = 15_000
+_SQLITE_WAL_ENABLED = True
+def _is_in_memory_sqlite(url: str) -> bool:
+    # ``sqlite://`` (no path) and ``sqlite:///:memory:`` are the two
+    # shapes SQLAlchemy recognises as the :memory: database. WAL does
+    # not apply to :memory: (no file to journal) so we skip the PRAGMA
+    # to avoid a harmless-but-noisy warning from SQLite.
+    if not url:
+        return False
+    return url in {"sqlite://", "sqlite:///:memory:"} or ":memory:" in url
+
+
 def _make_engine(url: str) -> Engine:
     connect_args: dict[str, object] = {}
     is_sqlite = url.startswith("sqlite")
@@ -25,12 +37,34 @@ def _make_engine(url: str) -> Engine:
     engine = create_engine(url, future=True, connect_args=connect_args)
 
     if is_sqlite:
+        in_memory = _is_in_memory_sqlite(url)
 
         @event.listens_for(engine, "connect")
         def _set_sqlite_pragmas(dbapi_conn, _: object) -> None:  # type: ignore[no-untyped-def]
+            # Called once per physical connection. The canonical DB is
+            # shared across every cohort run / retry script / observer
+            # backfill, so we need three things:
+            #   1. FKs on, same as before.
+            #   2. WAL so two processes (cohort runner + ad-hoc retry)
+            #      can write concurrently without corrupting each other.
+            #   3. busy_timeout so short contention doesn't surface as
+            #      "database is locked" mid-fetch - the blocker is
+            #      almost always a fast metadata write.
             cursor = dbapi_conn.cursor()
             try:
                 cursor.execute("PRAGMA foreign_keys=ON")
+                cursor.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
+                if _SQLITE_WAL_ENABLED and not in_memory:
+                    # journal_mode is persistent across connections so
+                    # issuing this on every connect is cheap - SQLite
+                    # no-ops when already WAL - but leaving it here
+                    # means the very first connect on a fresh DB also
+                    # flips the mode, which matters for the backfill
+                    # migration.
+                    cursor.execute("PRAGMA journal_mode=WAL")
+                    # synchronous=NORMAL is the WAL-recommended pairing;
+                    # FULL is overkill when we're journaling anyway.
+                    cursor.execute("PRAGMA synchronous=NORMAL")
             finally:
                 cursor.close()
 

@@ -33,9 +33,10 @@ from headcount.utils.time import month_floor
 # ---------------------------------------------------------------------------
 
 LINKEDIN_PUBLIC_PARSER_VERSION = "linkedin_public_v2"
-COMPANY_WEB_PARSER_VERSION = "company_web_v1"
+COMPANY_WEB_PARSER_VERSION = "company_web_v2"
 SEC_PARSER_VERSION = "sec_v1"
 WIKIDATA_PARSER_VERSION = "wikidata_v1"
+WAYBACK_PARSER_VERSION = "wayback_v1"
 
 # ---------------------------------------------------------------------------
 # LinkedIn logged-out public page
@@ -381,18 +382,45 @@ def extract_linkedin_jsonld_employees(html: str) -> LinkedInJsonLdEmployees | No
 _HTML_TAG_RE = re.compile(r"(?is)<script.*?</script>|<style.*?</style>|<[^>]+>")
 _WS_RE = re.compile(r"\s+")
 
+# v2 widens the stem set to include common synonyms for "employees" that
+# free-text company pages use interchangeably: FTEs (financial-page idiom),
+# "colleagues" (IBM/SAP-style), "associates" (Walmart/Target-style). The
+# stem group is a named sub-pattern so the qualified/exact variants stay in
+# sync.
+_EMPLOYEE_STEM = (
+    r"(?:employees|people|team\s+members|staff|"
+    r"ftes?|colleagues|associates)"
+)
+
 _COMPANY_EXACT_RE = re.compile(
-    r"\b(?P<n>\d{1,3}(?:,\d{3})+|\d{2,7})\s+"
-    r"(?:employees|people|team\s+members|staff)\b",
+    r"\b(?P<n>\d{1,3}(?:,\d{3})+|\d{2,7})\s+" + _EMPLOYEE_STEM + r"\b",
     flags=re.IGNORECASE,
 )
 _COMPANY_QUALIFIED_RE = re.compile(
     r"\b(?P<qual>over|more\s+than|approximately|approx\.?|about|around|nearly)\s+"
-    r"(?P<n>\d{1,3}(?:,\d{3})+|\d{2,7})\s+"
-    r"(?:employees|people|team\s+members|staff)\b",
+    r"(?P<n>\d{1,3}(?:,\d{3})+|\d{2,7})\s+" + _EMPLOYEE_STEM + r"\b",
     flags=re.IGNORECASE,
 )
-_COMPANY_TEAM_OF_RE = re.compile(r"\bteam\s+of\s+(?P<n>\d{2,6})\b", flags=re.IGNORECASE)
+_COMPANY_TEAM_OF_RE = re.compile(
+    r"\b(?:team|crew|squad|group|band)\s+of\s+(?P<n>\d{2,6})\b",
+    flags=re.IGNORECASE,
+)
+# "a 50-person team" / "our 120-person engineering org" / "42-person crew"
+_COMPANY_N_PERSON_RE = re.compile(
+    r"\b(?P<n>\d{2,6})[\-\u2013]person\b",
+    flags=re.IGNORECASE,
+)
+# "200 strong" / "200+ strong" - common idiom for "200-person team".
+_COMPANY_STRONG_RE = re.compile(
+    r"\b(?P<n>\d{2,6})\+?\s+strong\b",
+    flags=re.IGNORECASE,
+)
+# "headcount of 500" / "headcount: 500" - most structured phrasing we see
+# on careers / about pages.
+_COMPANY_HEADCOUNT_RE = re.compile(
+    r"\bheadcount\s*(?:of|:)?\s*(?P<n>\d{1,3}(?:,\d{3})+|\d{2,6})\b",
+    flags=re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -482,7 +510,90 @@ def parse_company_web_text(text: str) -> list[CompanyWebMatch]:
             )
         )
 
+    for m in _COMPANY_N_PERSON_RE.finditer(text):
+        n = _to_float(m.group("n"))
+        phrase = m.group(0)
+        if any(existing.phrase.lower() == phrase.lower() for existing in matches):
+            continue
+        matches.append(
+            CompanyWebMatch(
+                value_min=n * 0.9,
+                value_point=n,
+                value_max=n * 1.1,
+                kind=HeadcountValueKind.range,
+                phrase=phrase,
+                qualifier="n-person",
+            )
+        )
+
+    for m in _COMPANY_STRONG_RE.finditer(text):
+        n = _to_float(m.group("n"))
+        # "500+ strong" reads as "at least 500": widen the upper bound the
+        # same way the "over" qualifier does.
+        has_plus = "+" in m.group(0)
+        matches.append(
+            CompanyWebMatch(
+                value_min=n,
+                value_point=n * (1.1 if has_plus else 1.0),
+                value_max=n * (1.25 if has_plus else 1.1),
+                kind=HeadcountValueKind.range,
+                phrase=m.group(0),
+                qualifier="strong",
+            )
+        )
+
+    for m in _COMPANY_HEADCOUNT_RE.finditer(text):
+        n = _to_float(m.group("n"))
+        matches.append(
+            CompanyWebMatch(
+                value_min=n,
+                value_point=n,
+                value_max=n,
+                kind=HeadcountValueKind.exact,
+                phrase=m.group(0),
+                qualifier="headcount",
+            )
+        )
+
     return matches
+
+
+# ---------------------------------------------------------------------------
+# JSON-LD Organization.numberOfEmployees on first-party pages
+# ---------------------------------------------------------------------------
+#
+# The same ``application/ld+json`` Organization walker we use for LinkedIn
+# works verbatim for first-party company pages / press releases / about
+# pages. Many companies now ship this for SEO; it is by far the most
+# reliable structured signal we can get without an API contract.
+
+
+def parse_company_web_jsonld(html: str) -> list[CompanyWebMatch]:
+    """Return zero-or-one ``CompanyWebMatch`` from JSON-LD ``numberOfEmployees``.
+
+    Reuses :func:`extract_linkedin_jsonld_employees` because the schema is
+    schema.org, not LinkedIn-specific: the walker matches any
+    ``Organization`` / ``Corporation`` node regardless of host. Wrapped in
+    a ``CompanyWebMatch`` so the company-web observer can feed it through
+    the same signal-construction path as text matches.
+    """
+
+    parsed = extract_linkedin_jsonld_employees(html)
+    if parsed is None:
+        return []
+    kind = parsed.kind
+    # For exact values we keep the tight interval; for bucket values we
+    # widen to the min/max from the schema (e.g. 51..200).
+    return [
+        CompanyWebMatch(
+            value_min=float(parsed.low),
+            value_point=float(parsed.point),
+            value_max=float(parsed.high),
+            kind=kind,
+            phrase=parsed.phrase,
+            qualifier="jsonld",
+        )
+    ]
 
 
 # ---------------------------------------------------------------------------

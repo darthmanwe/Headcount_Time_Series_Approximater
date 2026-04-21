@@ -39,6 +39,7 @@ class SourceName(enum.StrEnum):
     wikidata = "wikidata"
     free_api = "free_api"
     benchmark = "benchmark"
+    wayback = "wayback"
 
 
 class SourceEntityType(enum.StrEnum):
