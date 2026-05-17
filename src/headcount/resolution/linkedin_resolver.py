@@ -406,45 +406,9 @@ async def resolve_linkedin_slug(
         attempts.append((slug, method, verdict))
         return result
 
-    heuristic_gated = False
-    for slug, method in slug_candidates(name, domain):
-        result = await _try_slug(slug, method)
-        if result is not None:
-            _log.info(
-                "linkedin_slug_resolved",
-                name=name,
-                domain=domain,
-                slug=result.slug,
-                method=result.method,
-                title=result.title,
-                attempts=attempts,
-            )
-            return result
-        if guard.is_circuit_open():
-            if company_id:
-                guard.defer_company(company_id)
-            _log.warning(
-                "linkedin_resolver_circuit_tripped_mid_resolve",
-                name=name,
-                domain=domain,
-                attempts=attempts,
-            )
-            return None
-        # If the first heuristic probe for this company was gated, the
-        # remaining candidates will almost certainly 999 too (same host,
-        # same IP, seconds apart). Burn the whole slug budget here and
-        # we get fewer successful probes per cohort. Fast-fail the
-        # heuristic loop and let Bing/DDG try a fresh path; if that also
-        # fails the caller will defer the company for the recovery pass.
-        if attempts and attempts[-1][2] == "gated":
-            heuristic_gated = True
-            break
-
-    # Lever L6: heuristic candidates exhausted. Ask Bing.
-    # Bing is queried at most once per company, on a different host
-    # with a friendlier policy. Discovered slugs go through the same
-    # ``_probe`` path so they pay the same disambiguation + breaker
-    # checks heuristic candidates do.
+    # Lever L6 (search-first): ask DDG/Bing for likely LinkedIn slugs
+    # before heuristic probing. This usually reduces direct LinkedIn
+    # discovery pings to one verified candidate for straightforward names.
     if not guard.is_circuit_open():
         from headcount.resolution.bing_slug import fetch_bing_slug_candidates
 
@@ -471,6 +435,35 @@ async def resolve_linkedin_slug(
                 if company_id:
                     guard.defer_company(company_id)
                 break
+
+    for slug, method in slug_candidates(name, domain):
+        result = await _try_slug(slug, method)
+        if result is not None:
+            _log.info(
+                "linkedin_slug_resolved",
+                name=name,
+                domain=domain,
+                slug=result.slug,
+                method=result.method,
+                title=result.title,
+                attempts=attempts,
+            )
+            return result
+        if guard.is_circuit_open():
+            if company_id:
+                guard.defer_company(company_id)
+            _log.warning(
+                "linkedin_resolver_circuit_tripped_mid_resolve",
+                name=name,
+                domain=domain,
+                attempts=attempts,
+            )
+            return None
+        # If the first heuristic probe for this company was gated, the
+        # remaining candidates will almost certainly 999 too (same host,
+        # same IP, seconds apart). Fast-fail to preserve budget.
+        if attempts and attempts[-1][2] == "gated":
+            break
 
     # If any attempt was blocked by LinkedIn (status 999/429/403), park
     # the company on the guard's deferred queue so the breaker-recovery
